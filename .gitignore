@@ -1,0 +1,41 @@
+# Game data and anything derived from it — never commit
+game/
+game_*/
+dlc/
+iso_*/
+dumps/
+*.iso
+*.xex
+*.xbe
+*.xexp
+*.u
+*.upk
+*.bsm
+*.xma
+*.bik
+*.bin
+*.god
+*.stfs
+
+# Generated code (derived from the XEX) — keep only the SDK integration script
+app/generated/*
+!app/generated/rexglue.cmake
+
+# Build and run output (run/ holds test saves; docs/discs/ reports contain local paths)
+out/
+run/
+docs/discs/
+build/
+logs/
+*.log
+*.pdb
+*.ilk
+.vs/
+
+# Local SDK checkout
+.deps/
+
+timeline_shots/
+captures/
+*.cap
+*.rdc
