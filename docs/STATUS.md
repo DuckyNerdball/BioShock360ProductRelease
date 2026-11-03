@@ -92,3 +92,4 @@ Dump the BioShock 1 base game disc.
 - 2026-11-01 - Big Daddy ally state: DispositionToPlayer +0x1070 enum (0 none,1 hostile,2 friendly), bProtectingPlayer, EndProtectingPlayerTime +0x1078. P2 'ally' sets these every tick.
 - 2026-11-01 - Splicer->P2 aggro: setting AIController.Enemy (+0x4A0) is ignored; 1-dmg 'provoke' with P2 instigator crashed (invalid indirect call right after pause menu) -> removed. Needs the splicer target-tracker path.
 - 2026-11-01 - Splicer aggro on P2 via AEcologyFighter::AddForcedEnemy 0x825DB088(splicer, P2). F9 log: diagnostics hidden unless 'Verbose log'.
+- 2026-11-03 - 0x823A9670 - runtime: call to unregistered function (co-op run) - declared in [entrypoint.functions]

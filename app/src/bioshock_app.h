@@ -22,6 +22,7 @@
 #include <rex/ui/window_listener.h>
 
 extern std::function<void(bool)> g_split_window_fn;  // give.cpp
+void BsInstallCrashTrace();                           // crash_trace.cpp
 
 class BioshockApp : public rex::ReXApp {
  public:
@@ -57,6 +58,7 @@ class BioshockApp : public rex::ReXApp {
     rex::ui::RegisterBind("bind_testing", "F9", "Toggle BioShock Testing overlay", [] { TestingDialog::Toggle(); });
     rex::ui::RegisterBind("bind_p2", "F8", "Keyboard+mouse: control P1 / P2", [] { BsP2ToggleKeyboard(); });
     g_split_window_fn = [this](bool on) { SetSplitWindow(on); };
+    rex::ui::RegisterBind("bind_pad_swap", "F6", "Co-op: controller drives Jack / the Big Daddy (main window follows)", [] { BsPadSwap(); });
     rex::ui::RegisterBind("bind_split_swap", "F7", "Co-op split: swap which window shows which player", [] { BsSplitInvert(!BsSplitInverted()); });
   }
   // Split view: a second window with its own presenter. Frames the game tags as view 1 are routed
@@ -102,11 +104,12 @@ class BioshockApp : public rex::ReXApp {
   // While the F9 panel is open, the game gets no pad/keyboard input (the panel uses it).
   // Replaces the SDK's callback set in ConstructRuntime (same mouse rule otherwise).
   void OnPreLaunchModule() override {
+    BsInstallCrashTrace();
     auto* in = static_cast<rex::input::InputSystem*>(runtime()->input_system());
     auto* d = imgui_drawer();
     // Co-op (two windows + F8): controllers stay with Jack, keyboard/mouse go to the Big Daddy.
     if (in && d) in->SetActiveCallbacks(
-        [d] { return !TestingDialog::Visible() && !(BsP2KeyboardActive() && !BsCoopSplit()) && !d->GetIO().WantCaptureMouse; },
+        [d] { return !TestingDialog::Visible() && !(BsP2KeyboardActive() && !BsCoopSplit()) && !BsPadOnP2() && !d->GetIO().WantCaptureMouse; },
         [d] { return !TestingDialog::Visible() && !BsP2KeyboardActive() && !d->GetIO().WantCaptureMouse; });
   }
   std::unique_ptr<TestingDialog> testing_;

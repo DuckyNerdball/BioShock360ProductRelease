@@ -27,8 +27,16 @@ void BsSplitWindow(bool on);   // give.cpp: second window, alternate frames
 void BsSplitInvert(bool inv);
 bool BsCoopSplit();
 bool BsSplitInverted();
+bool BsPadOnP2();               // co-op: controller currently drives the Big Daddy
+void BsPadSwap();               // co-op: move the controller to the other player (Back / F6)
 void BsSplitDefault(bool on);
 void BsJackBody(bool on);
+void BsP2Blind(bool on);
+void BsP2Squeeze(bool on);
+void BsP2FreezeThink(bool on);
+void BsP2FreezeAI(bool ctl, bool pawn);
+void BsSetTrace(bool on);
+void BsSetProbe(bool on);
 int BsGetViewMode();             // two windows on: controller = Jack, keyboard/mouse = P2
 std::string BsSplitStats();
 void BsSetAttackRecorder(bool on);
@@ -360,6 +368,20 @@ class TestingDialog : public rex::ui::ImGuiDialog {
       if (ImGui::Checkbox("P2 uses real Big Daddy weapons (off = simple damage)", &realw)) BsP2RealWeapons(realw);
       static bool ally = true;
       if (ImGui::Checkbox("P2 is your ally (hypnotized: enemies fight him, never hits Jack)", &ally)) BsP2Ally(ally);
+      static bool trace = true, probe = true;
+      if (ImGui::Checkbox("Trace P2 script calls (log summary every 5 s)", &trace)) BsSetTrace(trace);
+      ImGui::SameLine();
+      if (ImGui::Checkbox("Call-stack probe", &probe)) BsSetProbe(probe);
+      static bool freeze_ctl = true, freeze_pawn = true;
+      if (ImGui::Checkbox("Freeze P2's AI decisions while you drive", &freeze_ctl)) BsP2FreezeAI(freeze_ctl, freeze_pawn);
+      ImGui::SameLine();
+      if (ImGui::Checkbox("+ his body's state code (auto-off when he dies)", &freeze_pawn)) BsP2FreezeAI(freeze_ctl, freeze_pawn);
+      static bool think = true;
+      if (ImGui::Checkbox("Freeze P2's native AI think while you drive (perception, targeting, decisions)", &think)) BsP2FreezeThink(think);
+      static bool squeeze = true;
+      if (ImGui::Checkbox("Squeeze: P2 fits through tight spaces while you drive (Jack-sized collision)", &squeeze)) BsP2Squeeze(squeeze);
+      static bool blind = true;
+      if (ImGui::Checkbox("Blind P2's AI while you drive (clears its enemy/focus every tick)", &blind)) BsP2Blind(blind);
       static bool silence = false;
       if (ImGui::Checkbox("Silence P2's AI (CRASHES in fights - test only)", &silence)) BsP2Silence(silence);
       int view_mode = BsGetViewMode();
@@ -375,11 +397,13 @@ class TestingDialog : public rex::ui::ImGuiDialog {
         bool inv = BsSplitInverted();
         if (ImGui::Checkbox("Swap windows (F7)", &inv)) BsSplitInvert(inv);
         ImGui::SameLine();
+        if (ImGui::Button(BsPadOnP2() ? "Controller -> Jack (Back / F6)" : "Controller -> Big Daddy (Back / F6)")) BsPadSwap();
+        ImGui::SameLine();
         ImGui::TextDisabled("%s", BsSplitStats().c_str());
       }
       static bool body = false;
       if (ImGui::Checkbox("Give Jack a body in the Big Daddy's view (Splicer model, EXPERIMENTAL; reload save to undo)", &body)) BsJackBody(body);
-      ImGui::TextDisabled(BsP2Pawn() ? "P2: 2nd controller, or F8 = WASD move, mouse turn, LMB punch, RMB drill, F slam, Space jump, Shift run | pad: RT punch, LT/LB/RB drill, B slam, A jump, L3 run"
+      ImGui::TextDisabled(BsP2Pawn() ? "P2 keys: WASD move, mouse turn, LMB punch, RMB drill, F slam, C or Shift+F charge, R shove, T roar, Space jump, Shift run, E pick up, Alt free mouse | pad: RT punch, LT/LB/RB drill, B slam, D-right or L3+B charge, Y shove, D-up roar, A jump, X pick up, L3 run, Back = swap controller"
                                      : "no P2 yet: pick a body, Spawn P2");
     }
 

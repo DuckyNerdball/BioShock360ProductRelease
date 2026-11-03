@@ -15,6 +15,7 @@
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <unordered_map>
 #include <string>
 #include <vector>
 #include <cstring>
@@ -35,6 +36,7 @@ extern "C" void __imp__sub_82548290(PPCContext& __restrict ctx, uint8_t* base); 
 // AShockPlayer exec natives the HUD calls constantly: used only to capture the player pointer.
 extern "C" void __imp__sub_82462F60(PPCContext& __restrict ctx, uint8_t* base);  // StaticFindObject(Class|0, Outer, Name, Exact)
 extern "C" void __imp__sub_821C5028(PPCContext& __restrict ctx, uint8_t* base);  // FindObject(ANY_PACKAGE=-1, Name, 0) -> UClass*
+extern "C" void __imp__sub_821CE930(PPCContext& __restrict ctx, uint8_t* base);  // AActor::SetCollisionSize(f1 radius, f2 height)
 extern "C" void __imp__sub_822A0870(PPCContext& __restrict ctx, uint8_t* base);  // FindField(UClass*, PropName) -> UProperty*
 extern "C" void __imp__sub_821640E8(PPCContext& __restrict ctx, uint8_t* base);  // FString::FString(const TCHAR*)
 extern "C" void __imp__sub_821B07A0(PPCContext& __restrict ctx, uint8_t* base);  // TFieldIterator<UProperty>::IterateToNext
@@ -63,6 +65,35 @@ bool g_spawn_done = false;
 inline uint32_t BE32(uint8_t* b, uint32_t a) {
   return uint32_t(b[a]) << 24 | uint32_t(b[a + 1]) << 16 | uint32_t(b[a + 2]) << 8 | b[a + 3];
 }
+// ---- Call-stack probe (recon for the script tracer). The recompiled code keeps guest return
+// addresses: every call sets ctx.lr and each prologue saves it at (caller sp - 8), with the back
+// chain at 0(sp). So from any hook we can walk the guest stack. Each site logs its first few hits
+// as "probe <site>: <ret0> <ret1> ...", mapped offline to functions (find ProcessEvent / CallFunction).
+std::atomic<bool> g_probe{true};
+std::string GuestBacktrace(uint8_t* base, const PPCContext& ctx, int max_frames = 14) {
+  auto code = [](uint32_t a) { return a >= 0x82000000 && a < 0x83000000; };
+  std::string out = fmt::format("{:08X}", uint32_t(ctx.lr));
+  uint32_t sp = ctx.r1.u32;
+  for (int k = 0; k < max_frames; ++k) {
+    uint32_t prev = BE32(base, sp);
+    if (prev <= sp || prev - sp > 0x40000) break;
+    uint32_t ret = BE32(base, prev - 8);
+    if (!code(ret)) break;
+    out += fmt::format(" {:08X}", ret);
+    sp = prev;
+  }
+  return out;
+}
+void Probe(const char* site, uint8_t* base, const PPCContext& ctx, const std::string& extra = "", int limit = 4) {
+  if (!g_probe.load()) return;
+  static std::mutex mu; static std::unordered_map<std::string, int> counts;
+  {
+    std::lock_guard<std::mutex> lk(mu);
+    if (++counts[site] > limit) return;
+  }
+  REXLOG_INFO("bioshock-recomp: probe {}: this {:08X}{} | stack {}", site, ctx.r3.u32, extra, GuestBacktrace(base, ctx));
+}
+
 std::atomic<bool> g_verbose{false};
 bool IsDiag(const std::string& s) {
   static const char* kDiag[] = {"cam:", "P2 move:", "P2: weapon", "P2: drill", "P2: hit ", "P2: swing",
@@ -115,6 +146,7 @@ uint32_t FindUClass(uint8_t* base) {
   return 0;
 }
 }  // namespace
+void BsSetProbe(bool on) { g_probe = on; }  // outside the anonymous namespace: called from the panel
 
 namespace {
 bool InHeap(uint32_t a) { return a >= 0x40000000 && a < 0x5F000000; }
@@ -166,6 +198,10 @@ extern "C" REX_FUNC(sub_824C6D68) {
 }
 
 extern "C" REX_FUNC(sub_824BE0D8) {
+  if (uint32_t p = g_player.load(); p && BE32(base, ctx.r3.u32 + 0x38) == p) {
+    uint32_t stk = ctx.r4.u32;
+    Probe("inv.AddStack", base, ctx, fmt::format(" item class {:08X} x{}", BE32(base, stk + 0x48), BE32(base, stk + 0x4C)), 6);
+  }
   // Only the player's own inventory (NPCs and containers call this too).
   if (uint32_t p = g_player.load(); p && BE32(base, ctx.r3.u32 + 0x38) == p && g_invmgr.load() != ctx.r3.u32) {
     REXLOG_INFO("bioshock-recomp: give: captured InventoryManager {:08X}", ctx.r3.u32);
@@ -629,7 +665,11 @@ int BsGetViewMode() { return g_view_mode.load(); }
 std::atomic<uint32_t> g_cam_actor{0}, g_cam_class{0};
 std::atomic<bool> g_cam_want{false};
 std::atomic<bool> g_split_default{true};   // spawning P2 (D-pad x5 / triple F8) opens co-op split
-std::atomic<bool> g_jack_body{false};      // experimental: give Jack a Splicer mesh in the P2 view
+std::atomic<bool> g_jack_body{false};
+std::atomic<bool> g_p2_blind{true};
+std::atomic<bool> g_p2_squeeze{true};      // while you drive: collision radius shrunk to about Jack's        // while you drive: clear P2's AI Enemy/Focus every tick
+std::atomic<uint32_t> g_p2_yaw_of{0};      // pawn whose facing we own (0 = re-read from the pawn)
+std::atomic<uint32_t> g_ai_swings{0};      // AI-started weapon calls on P2 while you drive      // experimental: give Jack a Splicer mesh in the P2 view
 // Split view (two windows): the app installs the window opener; the frame tag lives in the SDK.
 std::function<void(bool)> g_split_window_fn;
 void BsSplitWindow(bool on) {
@@ -641,8 +681,24 @@ void BsSplitWindow(bool on) {
 bool BsCoopSplit() { return rex::graphics::split_view::state().enabled.load(); }
 void BsSplitInvert(bool inv) { rex::graphics::split_view::state().invert = inv; }
 bool BsSplitInverted() { return rex::graphics::split_view::state().invert.load(); }
+// Co-op: which player the controller (pad 0) drives. Back / F6 flips it, and the views swap so the
+// player you are holding the controller for is always in the main window.
+std::atomic<bool> g_pad_p2{false};
+bool BsPadOnP2() { return g_pad_p2.load() && BsCoopSplit(); }
+void BsPadSwap() {
+  if (!BsCoopSplit() || !g_p2.load()) { Log("Controller swap: only in co-op split (spawn a Big Daddy first)"); return; }
+  bool to_p2 = !g_pad_p2.load();
+  g_pad_p2 = to_p2;
+  if (to_p2) g_p2_kbd = true;  // the Big Daddy has to be in driven mode for any input to reach him
+  auto& sv = rex::graphics::split_view::state();
+  sv.invert = !sv.invert.load();  // relative flip, so a manual F7 correction is kept
+  Log(to_p2 ? "Controller -> Big Daddy (his view is now the main window). Back / F6 = back to Jack"
+            : "Controller -> Jack (main window). Back / F6 = Big Daddy");
+}
 void BsSplitDefault(bool on) { g_split_default = on; }
 void BsJackBody(bool on) { g_jack_body = on; }
+void BsP2Blind(bool on) { g_p2_blind = on; }
+void BsP2Squeeze(bool on) { g_p2_squeeze = on; }
 std::string BsSplitStats() {
   namespace sv = rex::graphics::split_view;
   return fmt::format("frames: main {}  P2 window {}", sv::state().frames_routed[0].load(), sv::state().frames_routed[1].load());
@@ -680,6 +736,8 @@ void BsPollPadSpawnCombo() {
 // F9 panel open: world frozen ("playersonly" = only players tick) and P2 ignores input, so menu
 // navigation with the pad does not punch/jump. Restored when the panel closes.
 std::atomic<bool> g_panel_open{false};
+bool BsPanelIsOpen() { return g_panel_open.load(); }
+bool g_our_fire = false;  // set while P2's own (player-driven) weapon call runs
 bool g_panel_froze = false;
 bool g_user_frozen = false;  // "Freeze world" checkbox
 void BsPanelOpen(bool open) {
@@ -781,7 +839,9 @@ static bool FireBDWeapon(PPCContext& ctx, uint8_t* base, uint32_t pawn, uint32_t
   ctx.r1.u64 = sp; ctx.r3.u64 = fn; ctx.r4.u64 = str; ctx.r5.u64 = 1; ctx.r6.u64 = 1;
   __imp__sub_824697D8(ctx, base);
   ctx.r1.u64 = sp; ctx.r3.u64 = w; ctx.r4.u64 = fn;
+  g_our_fire = true;
   if (PPCFunc* f = rex::runtime::ResolveIndirectFunction(BE32(base, BE32(base, w) + 740))) f(ctx, base);
+  g_our_fire = false;
   ctx = saved;
   return true;
 }
@@ -925,7 +985,7 @@ static void BsCamTick(PPCContext& ctx, uint8_t* base, uint32_t p) {
                             : "split cam: last try - if this fails the P2 view orbits with Jack's look");
     }
     if (odd) {
-      if (g_p2_kbd.load()) s_bd_pitch = std::clamp(s_bd_pitch - BsMouseDY() * 40, -11000, 5000);
+      if (g_p2_kbd.load()) s_bd_pitch = std::clamp(s_bd_pitch - BsMouseDY() * 40 + (g_pad_p2.load() ? int(g_pad_pitch / 32767.0f * 300.0f) : 0), -11000, 5000);
       if (cam_ok) {
         // Orbit camera: 330 units behind the Big Daddy's head, looking along his facing.
         const float k = 6.2831853f / 65536.0f;
@@ -975,18 +1035,186 @@ static void BsCamTick(PPCContext& ctx, uint8_t* base, uint32_t p) {
   (void)ctx;
 }
 
+// ---- P2 "use": the Big Daddy picks up the nearest loose item; it goes into Jack's (shared)
+// inventory through the same AddStackToInventory call the F9 give uses. BioShock world pickups are
+// ...PickupItem actors; the item class is the actor's own class unless a property names another.
+static bool GiveItemClass(PPCContext& ctx, uint8_t* base, uint32_t klass, uint32_t* count) {
+  DeriveFromPlayer(base);
+  uint32_t inv = g_invmgr.load();
+  if (!inv || !klass) return false;
+  PPCContext saved = ctx;
+  uint32_t sp = (ctx.r1.u32 - 0x4000) & ~0xFu, stk = sp + 0x1000;
+  auto put = [&](uint32_t a, uint32_t v) { base[a] = uint8_t(v >> 24); base[a + 1] = uint8_t(v >> 16); base[a + 2] = uint8_t(v >> 8); base[a + 3] = uint8_t(v); };
+  bool ok = false;
+  for (uint32_t n = std::max(1u, *count); n >= 1 && !ok; n /= 2) {  // ammo caps: halve until it fits
+    std::memset(base + stk, 0, 0x200);
+    put(stk + 0x48, klass); put(stk + 0x4C, n);
+    ctx.r1.u64 = sp; ctx.r3.u64 = inv; ctx.r4.u64 = stk;
+    __imp__sub_824BE0D8(ctx, base);
+    if (ctx.r3.u32) { ok = true; *count = n; }
+    ctx = saved;
+  }
+  ctx = saved;
+  return ok;
+}
+// Lists an object's own script properties (name, type, offset, raw value), class chain up to Actor.
+// Used once per pickup class so we can see where the item class / count live.
+static void DumpProps(PPCContext& ctx, uint8_t* base, uint32_t obj, const char* why) {
+  uint32_t o0 = 0, m0 = 0;
+  FindPropOffset(ctx, base, obj, "Location", &o0, &m0);  // calibrates g_prop_off_field
+  if (g_prop_off_field < 0) return;
+  uint32_t sp = (ctx.r1.u32 - 0x5000) & ~0xFu;
+  std::string out;
+  int lines = 0;
+  for (uint32_t c = BE32(base, obj + 0x2C), k = 0; c && HeapOrImg(c) && k < 8; c = BE32(base, c + 0x38), ++k) {
+    std::string cn = FNameStr(ctx, base, c, sp);
+    if (cn == "Actor" || cn == "Object") break;
+    for (uint32_t f = BE32(base, c + 0x44), guard = 0; f && HeapOrImg(f) && guard < 400; f = BE32(base, f + 0x3C), ++guard) {
+      std::string ty = FNameStr(ctx, base, BE32(base, f + 0x2C), sp);
+      if (ty.size() < 8 || ty.compare(ty.size() - 8, 8, "Property") != 0) continue;
+      uint32_t off = BE32(base, f + g_prop_off_field);
+      if (off > 0x4000) continue;
+      out += fmt::format("\n    {}.{} {} +{:X} = {:08X}", cn, FNameStr(ctx, base, f, sp), ty, off, BE32(base, obj + off));
+      if (++lines > 120) break;
+    }
+  }
+  REXLOG_INFO("bioshock-recomp: give: props of {:08X} ({}):{}", obj, why, out);
+}
+
+// Class lookup by bare name in any package (FindObject<UClass>(ANY_PACKAGE, Name)). 0 if none.
+static uint32_t FindClassByName(PPCContext& ctx, uint8_t* base, const std::string& name) {
+  PPCContext saved = ctx;
+  uint32_t sp = (ctx.r1.u32 - 0x4800) & ~0xFu, s1 = sp + 0x2000;
+  for (size_t i = 0; i < name.size() && i < 200; ++i) { base[s1 + 2 * i] = 0; base[s1 + 2 * i + 1] = uint8_t(name[i]); }
+  base[s1 + 2 * name.size()] = base[s1 + 2 * name.size() + 1] = 0;
+  ctx.r1.u64 = sp; ctx.r3.u64 = 0xFFFFFFFFu; ctx.r4.u64 = s1; ctx.r5.u64 = 0;
+  __imp__sub_821C5028(ctx, base);
+  uint32_t c = ctx.r3.u32;
+  ctx = saved;
+  return c;
+}
+
+static void BsP2Use(PPCContext& ctx, uint8_t* base, uint32_t p) {
+  uint32_t pl = g_player.load(), d = 0, n = 0;
+  if (!InHeap(pl) || !FindActorList(base, pl, &d, &n)) { Log("P2 use: level actor list not found"); return; }
+  auto getf = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
+  auto putf = [&](uint32_t a, float f) { uint32_t v; std::memcpy(&v, &f, 4); base[a] = uint8_t(v >> 24); base[a + 1] = uint8_t(v >> 16); base[a + 2] = uint8_t(v >> 8); base[a + 3] = uint8_t(v); };
+  static std::vector<uint32_t> s_taken;
+  float px = getf(p + 0x1C0), py = getf(p + 0x1C4), pz = getf(p + 0x1C8);
+  uint32_t sp = (ctx.r1.u32 - 0x5000) & ~0xFu, best = 0;
+  float bestd = 230.0f * 230.0f;  // Big Daddy reach
+  std::string bestcn;
+  std::vector<std::pair<float, std::string>> near;  // recon: what IS in reach when nothing matches
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t a = BE32(base, d + 4 * i);
+    if (!InHeap(a) || a == p || a == pl) continue;
+    if (std::find(s_taken.begin(), s_taken.end(), a) != s_taken.end()) continue;
+    float dx = getf(a + 0x1C0) - px, dy = getf(a + 0x1C4) - py, dz = getf(a + 0x1C8) - pz;
+    float d2 = dx * dx + dy * dy;
+    if (d2 >= 230.0f * 230.0f || std::fabs(dz) > 180.0f) continue;
+    bool pick = false; std::string first, chain;
+    for (uint32_t c = BE32(base, a + 0x2C), k = 0; c && HeapOrImg(c) && k < 12; c = BE32(base, c + 0x38), ++k) {
+      std::string nm = FNameStr(ctx, base, c, sp);
+      if (k == 0) first = nm;
+      if (k > 0 && k < 4) chain += "<" + nm;
+      if (nm == "Pickup" || nm.find("PickupItem") != std::string::npos || nm.find("Ammo") != std::string::npos ||
+          nm.find("Money") != std::string::npos || nm.find("Cash") != std::string::npos) { pick = true; break; }
+    }
+    if (!pick) near.push_back({d2, first + chain});
+    if (d2 >= bestd) continue;
+    if (pick) { best = a; bestd = d2; bestcn = first; }
+  }
+  if (!best) {
+    std::sort(near.begin(), near.end());
+    std::string list;
+    for (size_t i = 0; i < near.size() && i < 6; ++i) list += fmt::format(" | {} ({:.0f})", near[i].second, std::sqrt(near[i].first));
+    Log("P2 use: nothing to pick up within reach");
+    REXLOG_INFO("bioshock-recomp: give: P2 use: in reach but not pickups:{}", list.empty() ? " (nothing)" : list);
+    return;
+  }
+  // Item class: a property naming it, else the actor's own class. Count: first sane int property.
+  uint32_t item_cls = BE32(base, best + 0x2C), count = 1, o = 0, m = 0;
+  std::string how = "own class", cnt_how = "default 1";
+  for (const char* nm : {"InventoryType", "ItemClass", "InventoryClass", "PickupClass", "ItemType"}) {
+    if (FindPropOffset(ctx, base, best, nm, &o, &m)) {
+      uint32_t v = BE32(base, best + o);
+      if (InHeap(v) || (v >= 0x82000000 && v < 0x83000000)) { item_cls = v; how = nm; break; }
+    }
+  }
+  for (const char* nm : {"StackCount", "Count", "Quantity", "Amount", "NumItems", "AmmoAmount", "StackSize"}) {
+    if (FindPropOffset(ctx, base, best, nm, &o, &m) && !m) {
+      uint32_t v = BE32(base, best + o);
+      if (v >= 1 && v <= 999) { count = v; cnt_how = nm; break; }
+    }
+  }
+  uint32_t got = count;
+  // World pickups (EVEHypoPickup, PistolBulletPickup, ...) are spawners, not items: resolve the item
+  // class from the name. Food/drink is eaten on the spot (small heal for Jack); story items stay.
+  std::string stem = bestcn;
+  if (stem.size() > 6 && stem.compare(stem.size() - 6, 6, "Pickup") == 0) stem.resize(stem.size() - 6);
+  auto has = [&](const char* k) { return bestcn.find(k) != std::string::npos; };
+  if (has("Adam") || has("Log") || has("Diary") || has("Key") || has("Quest")) {
+    Log(fmt::format("P2 use: {} is a story item - Jack has to pick that one up", bestcn));
+    return;
+  }
+  bool given = false;
+  if (how == "own class") {
+    std::vector<std::string> cands;
+    if (has("EVE") || has("BioAmmo")) cands.push_back("BioAmmoHypo");
+    if (has("FirstAid") || has("MedKit") || has("MedHypo") || has("Health")) cands.push_back("MedHypo");
+    cands.push_back(stem); cands.push_back(stem + "PickupItem"); cands.push_back(stem + "Item");
+    for (const std::string& c : cands) {
+      uint32_t k = FindClassByName(ctx, base, c);
+      if (!k) continue;
+      got = count;
+      if (GiveItemClass(ctx, base, k, &got)) { given = true; how = "name -> " + c; break; }
+    }
+  }
+  if (!given) given = GiveItemClass(ctx, base, item_cls, &got);
+  static const char* kFood[] = {"PowerBar", "Whisky", "Whiskey", "Cigarette", "Chips", "Beer", "Coffee", "Soda",
+                                "Bread", "Wine", "Peanut", "Pep", "Apple", "Banana", "Cake", "Gin", "Rum", "Vodka",
+                                "Cereal", "Food", "Drink", "Pie", "Liquor", "Brandy", "Sardine", "Potato"};
+  bool food = false;
+  for (const char* f : kFood) food = food || has(f);
+  if (!given && food && InHeap(pl)) {
+    // Eaten: +5 health to Jack (AShockPawn::AddHealth = vtable+912, f1 amount, r5 flag).
+    PPCContext saved = ctx;
+    ctx.r1.u64 = (ctx.r1.u32 - 0x4000) & ~0xFu; ctx.r3.u64 = pl; ctx.r5.u64 = 0; ctx.f1.f64 = 5.0;
+    if (PPCFunc* f = rex::runtime::ResolveIndirectFunction(BE32(base, BE32(base, pl) + 912))) f(ctx, base);
+    ctx = saved;
+    given = true; how = "eaten (+5 health for Jack)"; got = 1;
+  }
+  if (!given) {
+    static std::vector<uint32_t> s_dumped;  // one property dump per pickup class (recon)
+    uint32_t pc = BE32(base, best + 0x2C);
+    if (std::find(s_dumped.begin(), s_dumped.end(), pc) == s_dumped.end()) { s_dumped.push_back(pc); DumpProps(ctx, base, best, bestcn.c_str()); }
+    Log(fmt::format("P2 use: {} ({:08X}) - Jack's inventory refused it (full, or not an inventory item; class via {})", bestcn, best, how));
+    return;
+  }
+  // Taken: hide it, drop its collision, sink it under the floor so Jack cannot take it again.
+  s_taken.push_back(best);
+  if (s_taken.size() > 256) s_taken.erase(s_taken.begin());
+  SetBool(ctx, base, best, "bHidden", true);
+  SetBool(ctx, base, best, "bCollideActors", false);
+  SetBool(ctx, base, best, "bBlockActors", false);
+  putf(best + 0x1C8, getf(best + 0x1C8) - 4000.0f);
+  Log(fmt::format("P2 use: picked up {} x{} for Jack (class via {}, count via {})", bestcn, got, how, cnt_how));
+}
+
+void BsTraceFlush();
 void BsTickP2(PPCContext& ctx, uint8_t* base) {
+  BsTraceFlush();
   uint32_t p = g_p2.load();
   if (!p) return;
   if (!InHeap(p) || BE32(base, p + 0x2C) != g_p2_class.load()) { g_p2 = 0; g_p2_kbd = false; Log("P2: pawn gone"); return; }
   uint16_t b = 0; int16_t lx = 0, ly = 0, rx = 0, ry = 0; uint8_t rt = 0;
-  bool attack = false, drill = false, jump = false, slam_btn = false;
+  bool attack = false, drill = false, jump = false, slam_btn = false, use = false, shove = false, roar = false, charge_btn = false;
   // Controller Back/View button = swap between Jack and the Big Daddy (like F8).
   {
     static bool s_back = false;
     uint16_t pb0 = 0; int16_t a0, a1, a2, a3; uint8_t t0;
-    bool back = !g_panel_open.load() && !BsCoopSplit() && BsPadPollIndex(0, &pb0, &a0, &a1, &a2, &a3, &t0) && (pb0 & 0x0020);
-    if (back && !s_back) BsP2ToggleKeyboard();
+    bool back = !g_panel_open.load() && BsPadPollIndex(0, &pb0, &a0, &a1, &a2, &a3, &t0) && (pb0 & 0x0020);
+    if (back && !s_back) { if (BsCoopSplit()) BsPadSwap(); else BsP2ToggleKeyboard(); }
     s_back = back;
   }
   BsCamTick(ctx, base, p);  // camera runs even with the panel open (split view keeps routing)
@@ -994,7 +1222,9 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
   if (g_p2_kbd.load()) {
     ly = int16_t((BsKeyDown('W') ? 32767 : 0) - (BsKeyDown('S') ? 32767 : 0));
     lx = int16_t((BsKeyDown('D') ? 32767 : 0) - (BsKeyDown('A') ? 32767 : 0));
-    int turn = (BsKeyDown('E') || BsKeyDown(0x27) ? 1 : 0) - (BsKeyDown('Q') || BsKeyDown(0x25) ? 1 : 0);
+    int turn = (BsKeyDown(0x27) ? 1 : 0) - (BsKeyDown(0x25) ? 1 : 0);  // arrows; E is now Use
+    use = BsKeyDown('E');
+    shove = BsKeyDown('R'); roar = BsKeyDown('T'); charge_btn = BsKeyDown('C');
     rx = int16_t(std::clamp(turn * 32767 + BsMouseDX() * 2500, -32767, 32767));
     attack = BsKeyDown(0x01);
     drill = BsKeyDown(0x02);
@@ -1003,7 +1233,7 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
     // Your own controller (pad 0) also drives P2 while you are switched to him: game input is
     // blocked then, so this does not move Jack. Sticks add to WASD/mouse.
     uint16_t pb = 0; int16_t plx = 0, ply = 0, prx = 0, pry = 0; uint8_t prt = 0;
-    if (!BsCoopSplit() && BsPadPollIndex(0, &pb, &plx, &ply, &prx, &pry, &prt)) {  // co-op: pad 0 is Jack's
+    if ((!BsCoopSplit() || g_pad_p2.load()) && BsPadPollIndex(0, &pb, &plx, &ply, &prx, &pry, &prt)) {  // co-op: pad 0 is Jack's unless swapped
       auto add = [](int16_t a, int16_t b) { return int16_t(std::clamp(int(a) + int(b), -32767, 32767)); };
       lx = add(lx, plx); ly = add(ly, ply); rx = add(rx, prx);
       g_pad_pitch = pry;
@@ -1012,11 +1242,19 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
       drill = drill || (pb & 0x0300) || BsPadLT(0) > 100;
       jump = jump || (pb & 0x1000);
       slam_btn = slam_btn || (pb & 0x2000);
+      use = use || (pb & 0x4000);  // X
+      shove = shove || (pb & 0x8000);  // Y
+      roar = roar || (pb & 0x0001);    // D-pad up
+      charge_btn = charge_btn || (pb & 0x0008);  // D-pad right
       b |= pb;
     }
   } else if (BsPadPollIndex(1, &b, &lx, &ly, &rx, &ry, &rt)) {
     attack = rt > 100;
     drill = (b & 0x0300) != 0 || BsPadLT(1) > 100;
+    use = (b & 0x4000) != 0;  // X
+    shove = (b & 0x8000) != 0;  // Y
+    roar = (b & 0x0001) != 0;   // D-pad up
+    charge_btn = (b & 0x0008) != 0;  // D-pad right
     jump = (b & 0x1000) != 0;
     slam_btn = (b & 0x2000) != 0;
   } else {
@@ -1040,14 +1278,59 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
     if (g_split_default.load()) { BsSplitWindow(true); Log("P2: co-op split on - controller = Jack (window 1), keyboard+mouse = Big Daddy (window 2), F7 = swap windows"); }
     driving = true;
   }
-  if (!driving || !settled) return;
+  // Squeeze: while you drive, shrink his collision radius to about Jack's so he fits through doorways and
+  // narrow corridors (his model may clip walls a little). Done through the engine's own
+  // AActor::SetCollisionSize (sub_821CE930, from execSetCollisionSize 0x822F6F08) so the collision hash
+  // is updated properly; restored as soon as you stop driving. Height is kept (shrinking it would sink
+  // the model into the floor).
+  {
+    static uint32_t s_sz_for = 0, s_ro = 0, s_ho = 0;
+    static float s_r0 = 0, s_h0 = 0;
+    static bool s_small = false;
+    if (s_sz_for != p) {
+      s_sz_for = p; s_small = false; s_ro = s_ho = 0;
+      uint32_t m = 0;
+      if (FindPropOffset(ctx, base, p, "CollisionRadius", &s_ro, &m) && FindPropOffset(ctx, base, p, "CollisionHeight", &s_ho, &m)) {
+        auto rf = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
+        s_r0 = rf(p + s_ro); s_h0 = rf(p + s_ho);
+        Log(fmt::format("P2: collision radius {:.0f}, height {:.0f}", s_r0, s_h0));
+      } else { s_ro = s_ho = 0; }
+    }
+    bool want = g_p2_squeeze.load() && driving && settled;
+    if (s_ro && s_ho && s_r0 > 0 && want != s_small) {
+      float r = s_r0;
+      if (want) {
+        float jr = 0; uint32_t pl = g_player.load(), jo = 0, m = 0;
+        if (InHeap(pl) && FindPropOffset(ctx, base, pl, "CollisionRadius", &jo, &m)) { uint32_t v = BE32(base, pl + jo); std::memcpy(&jr, &v, 4); }
+        r = std::min(s_r0, std::max(jr > 1.0f && jr < 200.0f ? jr + 2.0f : s_r0 * 0.55f, 22.0f));
+      }
+      PPCContext sv = ctx;
+      ctx.r1.u64 = (ctx.r1.u32 - 0x5000) & ~0xFu; ctx.r3.u64 = p; ctx.f1.f64 = r; ctx.f2.f64 = s_h0;
+      __imp__sub_821CE930(ctx, base);
+      ctx = sv;
+      s_small = want;
+      Log(want ? fmt::format("P2: squeeze on - collision radius {:.0f} -> {:.0f} (fits tight spaces)", s_r0, r)
+               : fmt::format("P2: squeeze off - collision radius back to {:.0f}", s_r0));
+    }
+  }
+  if (!driving || !settled) { g_p2_yaw_of = 0; return; }
+  {  // Use: E / pad X - pick up the nearest loose item for Jack
+    static bool s_use_prev = false;
+    if (use && !s_use_prev) BsP2Use(ctx, base, p);
+    s_use_prev = use;
+  }
   static uint32_t s_p2_ctrl = 0, s_p2_ctrl_of = 0;
   if (s_p2_ctrl_of != p) { s_p2_ctrl_of = p; s_p2_ctrl = BE32(base, p + 0x420); }
   if (g_p2_detach.load()) put(p + 0x420, 0);  // no AI controller fighting the input
 
   // Turn.
-  int32_t yaw = int32_t(BE32(base, p + 0x1CC + 4)) + int32_t(dz(rx) * (drill ? 300.0f : 700.0f));  // steadier aim while drilling
-  put(p + 0x1CC + 4, uint32_t(yaw)); put(p + 0x310 + 4, uint32_t(yaw));
+  // His facing is ours: kept here and written every tick, so the AI cannot turn him while you drive.
+  static int32_t s_yaw = 0;
+  if (g_p2_yaw_of.load() != p) { g_p2_yaw_of = p; s_yaw = int32_t(BE32(base, p + 0x1CC + 4)); }
+  s_yaw += int32_t(dz(rx) * (drill ? 300.0f : 700.0f));  // steadier aim while drilling
+  int32_t yaw = s_yaw;
+  put(p + 0x1CC, 0); put(p + 0x1CC + 4, uint32_t(yaw)); put(p + 0x1CC + 8, 0);
+  put(p + 0x310, 0); put(p + 0x310 + 4, uint32_t(yaw)); put(p + 0x310 + 8, 0);
   float a = yaw * (6.2831853f / 65536.0f), fwd = dz(ly), side = dz(lx);
   if (drill && fwd == 0.0f && side == 0.0f) fwd = 0.35f;  // drilling pushes you slowly into the target
   float cx = std::cos(a), cy = std::sin(a);
@@ -1056,36 +1339,52 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
   uint32_t sp = (ctx.r1.u32 - 0x6000) & ~0xFu;
 
   // Move: XLevel->MoveActor(actor, Delta, Rotation, Hit, ...) = ULevel vtable+288, the same call
-  // AActor::execMove (0x822F7BA0) makes. Handles collision; small downward push keeps it grounded.
+  // AActor::execMove (0x822F7BA0) makes. Handles collision; see the step-up logic below.
   // Big Daddy pace: heavy walk ~210 u/s, lumbering run ~390 u/s (Shift / L3).
   const float kStep = (g_p2_kbd.load() && BsKeyDown(0x10)) || (b & 0x0040) ? 6.5f : 3.5f;
-  float dx = (cx * fwd - cy * side) * kStep, dy = (cy * fwd + cx * side) * kStep, dzv = -3.0f;
+  float dx = (cx * fwd - cy * side) * kStep, dy = (cy * fwd + cx * side) * kStep;
   uint32_t level = BE32(base, p + 228);
-  if (InHeap(level) && (fwd != 0.0f || side != 0.0f || true)) {
-    std::memset(base + sp + 80, 0, 0x100);
-    put(sp + 108, 1); put(sp + 116, 1);
-    putf(sp + 180, 1.0f); put(sp + 184, 0xFFFFFFFFu);  // FCheckResult at sp+144: Time=1, Item=-1
-    ctx.r1.u64 = sp; ctx.r3.u64 = level; ctx.r4.u64 = p;
-    ctx.r5.u64 = (fb(dx) << 32) | fb(dy);
-    ctx.r6.u64 = fb(dzv) << 32;
-    ctx.r7.u64 = (uint64_t(BE32(base, p + 0x1CC)) << 32) | uint32_t(yaw);
-    ctx.r8.u64 = uint64_t(BE32(base, p + 0x1CC + 8)) << 32;
-    ctx.r9.u64 = sp + 144; ctx.r10.u64 = 0;
+  if (InHeap(level) && (fwd != 0.0f || side != 0.0f)) {
+    // MoveActor does collision but no stair stepping (that lives in the engine's walk physics, which
+    // we bypass). So: 1) flat sweep, 2) if blocked, lift 24 units and sweep again (a step), else undo
+    // the lift (a wall), 3) settle onto the floor. Mixing the down-push into the forward sweep made
+    // slopes and floor lips eat most of the movement (the "bumps / resistance").
+    PPCFunc* mv = rex::runtime::ResolveIndirectFunction(BE32(base, BE32(base, level) + 288));
+    auto move = [&](float mx, float my, float mz) {
+      if (!mv) return;
+      std::memset(base + sp + 80, 0, 0x100);
+      put(sp + 108, 1); put(sp + 116, 1);
+      putf(sp + 180, 1.0f); put(sp + 184, 0xFFFFFFFFu);  // FCheckResult at sp+144: Time=1, Item=-1
+      ctx.r1.u64 = sp; ctx.r3.u64 = level; ctx.r4.u64 = p;
+      ctx.r5.u64 = (fb(mx) << 32) | fb(my);
+      ctx.r6.u64 = fb(mz) << 32;
+      ctx.r7.u64 = (uint64_t(BE32(base, p + 0x1CC)) << 32) | uint32_t(yaw);
+      ctx.r8.u64 = uint64_t(BE32(base, p + 0x1CC + 8)) << 32;
+      ctx.r9.u64 = sp + 144; ctx.r10.u64 = 0;
+      mv(ctx, base);
+      ctx = saved;
+    };
     float bx = getf(p + 0x1C0), by = getf(p + 0x1C4);
-    uint32_t moved_ret = 0;
-    if (fwd != 0.0f || side != 0.0f) {
-      if (PPCFunc* f = rex::runtime::ResolveIndirectFunction(BE32(base, BE32(base, level) + 288))) f(ctx, base);
-      moved_ret = ctx.r3.u32;
+    auto progress = [&] { float mx = getf(p + 0x1C0) - bx, my = getf(p + 0x1C4) - by; return std::sqrt(mx * mx + my * my); };
+    float want = std::sqrt(dx * dx + dy * dy);
+    move(dx, dy, 0.0f);
+    bool stepped = false;
+    if (progress() < want * 0.6f) {
+      float px = getf(p + 0x1C0), py = getf(p + 0x1C4), pz = getf(p + 0x1C8);
+      move(0.0f, 0.0f, 24.0f);
+      move(dx - (px - bx), dy - (py - by), 0.0f);
+      if (progress() < want * 0.6f) { putf(p + 0x1C0, px); putf(p + 0x1C4, py); putf(p + 0x1C8, pz); }
+      else stepped = true;
     }
-    ctx = saved;
-    // Fallback: if MoveActor did not move us (blocked by our call setup, physics, or the pawn's
-    // collision state), set the position directly. No wall collision on this path.
-    if (fwd != 0.0f || side != 0.0f) {
-      float mx = getf(p + 0x1C0) - bx, my = getf(p + 0x1C4) - by;
-      bool moved = mx * mx + my * my > 0.5f;
-      static int s_logged = 0;
-      if (s_logged < 3) { ++s_logged; Log(fmt::format("P2 move: MoveActor ret {} moved {:.1f} -> {}", moved_ret, std::sqrt(mx * mx + my * my), moved ? "ok" : "direct")); }
-      if (!moved) { putf(p + 0x1C0, bx + dx); putf(p + 0x1C4, by + dy); }
+    move(0.0f, 0.0f, stepped ? -30.0f : -6.0f);
+    // Truly stuck (no progress for ~1/3 s while pushing): nudge through, e.g. wedged on a corpse.
+    static int s_stuck = 0;
+    s_stuck = progress() < 0.05f ? s_stuck + 1 : 0;
+    if (s_stuck > 20) { putf(p + 0x1C0, bx + dx); putf(p + 0x1C4, by + dy); s_stuck = 0; }
+    static int s_logged = 0;
+    if (s_logged < 3 || (stepped && s_logged < 6)) {
+      ++s_logged;
+      Log(fmt::format("P2 move: wanted {:.1f} moved {:.1f}{}", want, progress(), stepped ? " (stepped up)" : ""));
     }
   }
   {
@@ -1299,6 +1598,27 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
       if (s_hold_of != p || fwd != 0.0f || side != 0.0f) { s_hold_of = p; s_hx = getf(p + 0x1C0); s_hy = getf(p + 0x1C4); }
       else { putf(p + 0x1C0, s_hx); putf(p + 0x1C4, s_hy); }  // idle: stay exactly where you left him
     }
+    // Blind his AI: no Enemy / Focus / MoveTarget means nothing to chase, face or attack.
+    // Offsets cached per controller class (the lookup walks the class fields).
+    if (g_p2_blind.load()) {
+      static uint32_t s_ccls = 0, s_off[3] = {};
+      uint32_t ctl = BE32(base, p + 0x420);
+      if (InHeap(ctl)) {
+        uint32_t cc = BE32(base, ctl + 0x2C);
+        if (cc != s_ccls) {
+          s_ccls = cc;
+          const char* names[3] = {"Enemy", "Focus", "MoveTarget"};
+          std::string found;
+          for (int i = 0; i < 3; ++i) {
+            uint32_t o = 0, m = 0;
+            s_off[i] = FindPropOffset(ctx, base, ctl, names[i], &o, &m) ? o : 0;
+            found += fmt::format(" {}=+{:X}", names[i], s_off[i]);
+          }
+          Log("P2: AI blinded (cleared every tick):" + found);
+        }
+        for (uint32_t o : s_off) if (o) put(ctl + o, 0);
+      }
+    }
     static bool s_nofire = false;
     bool want_nofire = g_p2_kbd.load();
     if (want_nofire != s_nofire) { s_nofire = want_nofire; SetBool(ctx, base, p, "bNoWeaponFiring", want_nofire); }
@@ -1352,10 +1672,77 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
                     near_hp.size(), res.empty() ? " none" : res));
     s_pending_attack = nullptr;
   }
+  // Charge: B while running (L3 / Shift held), or C. 0.8 s rush at ~3x walk speed, hand-weapon hit
+  // every 0.2 s on whatever is in front. Slam stays on B / F when not running.
+  const bool running = (g_p2_kbd.load() && BsKeyDown(0x10)) || (b & 0x0040);
+  static std::chrono::steady_clock::time_point s_charge_end{}, s_charge_hit{};
+  static bool s_charge_prev = false;
+  bool charge_req = charge_btn || (slam && running);
+  if (charge_req && !s_charge_prev && now > s_charge_end && now - s_last > std::chrono::milliseconds(900)) {
+    s_charge_end = now + std::chrono::milliseconds(800);
+    s_last = now;
+    PlaySlot(ctx, base, p, "BO_walkFWD_agg", 0, 8);
+    Log("P2: charge");
+  }
+  s_charge_prev = charge_req;
+  if (now < s_charge_end) {
+    // forward push on top of normal movement (MoveActor handles walls)
+    PPCFunc* mv = rex::runtime::ResolveIndirectFunction(BE32(base, BE32(base, BE32(base, p + 228)) + 288));
+    if (mv && InHeap(BE32(base, p + 228))) {
+      std::memset(base + sp + 80, 0, 0x100);
+      put(sp + 108, 1); put(sp + 116, 1); putf(sp + 180, 1.0f); put(sp + 184, 0xFFFFFFFFu);
+      ctx.r1.u64 = sp; ctx.r3.u64 = BE32(base, p + 228); ctx.r4.u64 = p;
+      ctx.r5.u64 = (fb(cx * 8.0f) << 32) | fb(cy * 8.0f); ctx.r6.u64 = 0;
+      ctx.r7.u64 = (uint64_t(BE32(base, p + 0x1CC)) << 32) | uint32_t(yaw);
+      ctx.r8.u64 = uint64_t(BE32(base, p + 0x1CC + 8)) << 32;
+      ctx.r9.u64 = sp + 144; ctx.r10.u64 = 0;
+      mv(ctx, base);
+      ctx = saved;
+    }
+    if (now - s_charge_hit > std::chrono::milliseconds(200)) {
+      s_charge_hit = now;
+      FireBDWeapon(ctx, base, p, 0x1284, "BigLeftHook");
+    }
+    slam = false;  // B was used for the charge
+  }
+  // Shove: Y / R. Push-back animation, hand-weapon hit, and a knockback impulse on enemies in front.
+  static bool s_shove_prev = false;
+  if (shove && !s_shove_prev && now - s_last > std::chrono::milliseconds(900)) {
+    s_last = now;
+    static int s_sv = 0;
+    PlaySlot(ctx, base, p, (s_sv++ & 1) ? "BO_PushBackSweep" : "BO_PushBack", 2, 1);
+    s_pending_slot = 0x1284; s_pending_attack = "BigLeftHook";
+    s_pending_t = now + std::chrono::milliseconds(400);
+    uint32_t d = 0, n = 0, pl = g_player.load(), pushed = 0;
+    if (pl && FindActorList(base, pl, &d, &n)) {
+      float px = getf(p + 0x1C0), py = getf(p + 0x1C4);
+      for (uint32_t i = 0; i < n; ++i) {
+        uint32_t o = BE32(base, d + 4 * i);
+        if (!InHeap(o) || o == p || o == pl || !(getf(o + 1356) > 0.0f)) continue;
+        float ox = getf(o + 0x1C0) - px, oy = getf(o + 0x1C4) - py, dd = std::sqrt(ox * ox + oy * oy);
+        if (dd < 1.0f || dd > 260.0f || (ox * cx + oy * cy) / dd < 0.2f) continue;
+        putf(o + 0x1D8, ox / dd * 900.0f); putf(o + 0x1D8 + 4, oy / dd * 900.0f); putf(o + 0x1D8 + 8, 300.0f);
+        ++pushed;
+      }
+    }
+    Log(fmt::format("P2: shove ({} pushed)", pushed));
+  }
+  s_shove_prev = shove;
+  // Roar: D-pad up / T. Threaten animations, no damage.
+  static bool s_roar_prev = false;
+  if (roar && !s_roar_prev && now - s_last > std::chrono::milliseconds(900)) {
+    s_last = now;
+    static const char* kRoar[] = {"BO_ThreatenA", "BO_Threaten_B", "BO_Threaten_D", "BO_insult_A"};
+    static int s_r = 0;
+    PlaySlot(ctx, base, p, kRoar[s_r++ & 3], 2, 1);
+    Log("P2: roar");
+  }
+  s_roar_prev = roar;
   bool slam_hit = false;
   if (slam && !s_slam_prev && now - s_last > std::chrono::milliseconds(900)) {
     PlaySlot(ctx, base, p, "BO_AttackShoulderSlamLONG", 2, 1);
     slam_hit = true;
+    Log("P2: slam");
   }
   s_slam_prev = slam;
   bool drill_tick = s_drilling && now - s_last > std::chrono::milliseconds(250);
@@ -1475,15 +1862,24 @@ extern "C" REX_FUNC(sub_822F8B80) {
     return;
   }
   if (g_p2_want.load() && !g_in_double && ctx.r4.u32) {
+    // Disarm before spawning: a Big Daddy spawns its own parts through this same function, and those
+    // inner spawns were briefly captured as P2 (and could be doubled). g_in_double blocks both.
+    g_p2_want = false;
+    g_in_double = true;
     __imp__sub_822F8B80(ctx, base);
+    g_in_double = false;
     if (uint32_t sp_ = ctx.r3.u32) {
-      g_p2_want = false; g_p2_class = BE32(base, sp_ + 0x2C); g_p2 = sp_;
+      g_p2_class = BE32(base, sp_ + 0x2C); g_p2 = sp_;
       Log(fmt::format("P2: controlling pawn {:08X} (second controller)", sp_));
-
+    } else {
+      g_p2_want = true;  // spawn failed (no room): try the next one
     }
     return;
   }
-  if (!g_double.load() || g_in_double || !ctx.r4.u32) { __imp__sub_822F8B80(ctx, base); return; }
+  // Never double the player's Big Daddy (a second D-pad x5 spawn with Double encounters on made a hostile clone).
+  if (!g_double.load() || g_in_double || !ctx.r4.u32 || (g_p2_class.load() && ctx.r4.u32 == g_p2_class.load())) {
+    __imp__sub_822F8B80(ctx, base); return;
+  }
   PPCContext args = ctx;
   __imp__sub_822F8B80(ctx, base);
   uint32_t spawned = ctx.r3.u32;
@@ -1532,9 +1928,46 @@ bool Interesting(const std::string& c) {
 void BsSetAttackRecorder(bool on) { g_rec = on; Log(on ? "recorder ON: make an AI Big Daddy attack" : "recorder off"); }
 bool BsP2KeyboardActive();
 void BsStopAnimOn(PPCContext& ctx, uint8_t* base, uint32_t actor, uint32_t handle);
+// ---- Self-learning AI freeze. The actor Tick steps state code through sub_8247E270 (return address
+// 0x82302E5C); the hook below records whose state code is running (t_state_owner). If that code then
+// tries to animate or swing your Big Daddy while you drive, the owner is logged and, if it belongs to
+// him (Owner/Instigator is his pawn or controller, or it is one of them), added to the freeze list.
+thread_local uint32_t t_state_owner = 0;
+static std::vector<uint32_t> g_frz_learned;
+static uint32_t g_frz_for = 0;
+static bool IsLearnedFrozen(uint32_t o) {
+  if (g_frz_for != g_p2.load()) { g_frz_learned.clear(); g_frz_for = g_p2.load(); }
+  return std::find(g_frz_learned.begin(), g_frz_learned.end(), o) != g_frz_learned.end();
+}
+static void LearnFreeze(PPCContext& ctx, uint8_t* base, const char* why, bool quiet_native = false) {
+  uint32_t o = t_state_owner, p2 = g_p2.load();
+  if (!o) {
+    static int s_native = 0;
+    if (!quiet_native && s_native++ < 3) REXLOG_INFO("bioshock-recomp: give: P2: {} on your Big Daddy came from native AI code (no state code): blocked at the native layer", why);
+    return;
+  }
+  if (!p2 || !InHeap(o) || IsLearnedFrozen(o)) return;
+  uint32_t pl = g_player.load(), ctl = BE32(base, p2 + 0x420);
+  if (o == pl || (pl && o == BE32(base, pl + 0x420))) return;  // never Jack
+  static std::vector<uint32_t> s_reported;
+  bool related = (o == p2 || o == ctl);
+  for (const char* f : {"Owner", "Instigator", "Pawn"}) {
+    uint32_t off = 0, m = 0;
+    if (!related && FindPropOffset(ctx, base, o, f, &off, &m)) { uint32_t v = BE32(base, o + off); related = (v == p2 || v == ctl); }
+  }
+  if (std::find(s_reported.begin(), s_reported.end(), o) == s_reported.end()) {
+    s_reported.push_back(o);
+    uint32_t sp = (ctx.r1.u32 - 0x5000) & ~0xFu;
+    REXLOG_INFO("bioshock-recomp: give: P2: state code of {:08X} ({}) did {} on your Big Daddy -> {}", o,
+                FNameStr(ctx, base, BE32(base, o + 0x2C), sp), why, related ? "FROZEN while you drive" : "not his, left alone");
+  }
+  if (related) g_frz_learned.push_back(o);
+}
+
 extern "C" REX_FUNC(sub_822F6558) {
   uint32_t self = ctx.r3.u32, sp0 = ctx.r1.u32, resp = ctx.r5.u32;
   bool block = self && self == BsP2Pawn() && BsP2KeyboardActive();
+  if (block && !g_our_anim) { Probe("ai.ScriptAnim", base, ctx); PPCContext k = ctx; LearnFreeze(ctx, base, "an animation"); ctx = k; }
   if (!g_rec.load() && !block) { __imp__sub_822F6558(ctx, base); return; }
   __imp__sub_822F6558(ctx, base);
   PPCContext keep = ctx;
@@ -1563,6 +1996,22 @@ extern "C" REX_FUNC(sub_822FEF30) {
   ctx = keep;
 }
 extern "C" REX_FUNC(sub_824F8B08) {
+  // Our own attacks call the native InitiateDamage directly, so any script call on P2's weapons
+  // while you drive is the AI swinging on its own. Count it and log the native target (vtable+740)
+  // so it can be hooked and blocked if this shows up.
+  if (uint32_t p2 = BsP2Pawn(); p2 && BsP2KeyboardActive() && InHeap(p2)) {
+    uint32_t w = ctx.r3.u32;
+    if (w && (w == BE32(base, p2 + 0x1284) || w == BE32(base, p2 + 0x1288) || w == BE32(base, p2 + 0x128C))) {
+      Probe("ai.SwingExec", base, ctx);
+      { PPCContext k = ctx; LearnFreeze(ctx, base, "a weapon swing"); ctx = k; }
+      uint32_t n = ++g_ai_swings;
+      if (n <= 3 || (n % 20) == 0) {
+        uint32_t vt = BE32(base, w);
+        REXLOG_INFO("bioshock-recomp: give: P2: AI swing #{} with weapon {:08X} (native InitiateDamage {:08X})", n, w,
+                    InHeap(vt) || (vt >= 0x82000000 && vt < 0x83000000) ? BE32(base, vt + 740) : 0);
+      }
+    }
+  }
   if (g_rec.load()) {
     PPCContext keep = ctx;
     uint32_t w = ctx.r3.u32;
@@ -1603,10 +2052,169 @@ extern "C" REX_FUNC(sub_823509D0) {
   if (!g_our_anim) {
     uint32_t p = BsP2Pawn();
     if (p && BsP2KeyboardActive() && ctx.r3.u32 == BE32(base, p + 992)) {
+      Probe("ai.NativeAnim", base, ctx);
       static uint32_t s_n = 0;
       if ((++s_n & 15) == 1) REXLOG_INFO("bioshock-recomp: P2 anim block: {} AI anim calls dropped", s_n);
       ctx.r3.u64 = 0; return;
     }
   }
   __imp__sub_823509D0(ctx, base);
+}
+
+// AWeapon::InitiateDamage native (vtable+740 of the Big Daddy weapons; found by the AI swing detector,
+// 2026-11-02). While you drive P2, only your own attacks (g_our_fire) may swing his weapons.
+extern "C" void __imp__sub_824F9EF8(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" REX_FUNC(sub_824F9EF8) {
+  if (!g_our_fire) {
+    uint32_t p2 = BsP2Pawn(), w = ctx.r3.u32;
+    if (p2 && BsP2KeyboardActive() && InHeap(p2) && w &&
+        (w == BE32(base, p2 + 0x1284) || w == BE32(base, p2 + 0x1288) || w == BE32(base, p2 + 0x128C))) {
+      static uint32_t s_n = 0;
+      if ((++s_n & 15) == 1) REXLOG_INFO("bioshock-recomp: give: P2: AI swing blocked ({} so far)", s_n);
+      ctx.r3.u64 = 0;
+      return;
+    }
+  }
+  __imp__sub_824F9EF8(ctx, base);
+}
+
+// Inventory / interaction execs (natfind 2026-11-02). Log + backtrace only; behaviour unchanged.
+extern "C" void __imp__sub_824BD440(PPCContext& __restrict ctx, uint8_t* base);  // UInventoryManager::execUseItem
+extern "C" void __imp__sub_824BCBC8(PPCContext& __restrict ctx, uint8_t* base);  // UInventoryManager::execOnUsedInventoryItem
+extern "C" void __imp__sub_824E6698(PPCContext& __restrict ctx, uint8_t* base);  // AShockPlayer::execOnStartedInteractingWithMachine
+extern "C" REX_FUNC(sub_824BD440) { Probe("inv.UseItem", base, ctx, "", 6); __imp__sub_824BD440(ctx, base); }
+extern "C" REX_FUNC(sub_824BCBC8) { Probe("inv.OnUsedItem", base, ctx, "", 6); __imp__sub_824BCBC8(ctx, base); }
+extern "C" REX_FUNC(sub_824E6698) { Probe("use.Machine", base, ctx, "", 6); __imp__sub_824E6698(ctx, base); }
+
+// ---- P2 script tracer. sub_82480E00 = UObject::CallFunction(this r3, FFrame* r4, Result r5,
+// UFunction* r6); sub_8247E270 = the bytecode runner native code enters
+// (ProcessEvent/ProcessInternal; not hooked, see below). Found with the call-stack probe, 2026-11-02. When on, every
+// script call on P2's pawn / AI controller / weapons is counted by name and summarized every 5 s.
+std::atomic<bool> g_trace{true};
+void BsSetTrace(bool on) { g_trace = on; }
+namespace {
+std::mutex g_tr_mu;
+std::unordered_map<std::string, uint32_t> g_tr_counts;
+std::unordered_map<uint32_t, std::string> g_tr_names;     // UFunction* -> name
+const char* TraceTag(uint8_t* base, uint32_t obj) {
+  uint32_t p2 = g_p2.load();
+  if (!p2 || !obj || !InHeap(p2)) return nullptr;
+  if (obj == p2) return "pawn";
+  if (obj == BE32(base, p2 + 0x420)) return "ai";
+  if (obj == BE32(base, p2 + 0x1284) || obj == BE32(base, p2 + 0x1288) || obj == BE32(base, p2 + 0x128C)) return "weapon";
+  return nullptr;
+}
+void TraceNote(PPCContext& ctx, uint8_t* base, const char* site, const char* tag, uint32_t fn) {
+  if (!HeapOrImg(fn)) return;
+  uint32_t sp = (ctx.r1.u32 - 0x6000) & ~0xFu;
+  std::lock_guard<std::mutex> lk(g_tr_mu);
+  auto it = g_tr_names.find(fn);
+  if (it == g_tr_names.end()) it = g_tr_names.emplace(fn, FNameStr(ctx, base, fn, sp)).first;
+  ++g_tr_counts[fmt::format("{} {}.{}", site, tag, it->second)];
+}
+}  // namespace
+void BsTraceFlush() {
+  static auto s_t0 = std::chrono::steady_clock::now();
+  if (std::chrono::steady_clock::now() - s_t0 < std::chrono::seconds(5)) return;
+  s_t0 = std::chrono::steady_clock::now();
+  std::vector<std::pair<std::string, uint32_t>> v;
+  { std::lock_guard<std::mutex> lk(g_tr_mu); v.assign(g_tr_counts.begin(), g_tr_counts.end()); g_tr_counts.clear(); }
+  if (v.empty()) return;
+  std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+  std::string out;
+  for (size_t i = 0; i < v.size() && i < 40; ++i) out += fmt::format("\n    {:6} {}", v[i].second, v[i].first);
+  REXLOG_INFO("bioshock-recomp: trace P2 (5 s, {} distinct, kbd {}):{}", v.size(), g_p2_kbd.load(), out);
+}
+extern "C" void __imp__sub_82480E00(PPCContext& __restrict ctx, uint8_t* base);
+// AI-decision calls on your Big Daddy while you drive. Each one triggers the self-learning freeze (if the
+// running state code belongs to him it gets frozen) and logs one guest call stack per name, so a native
+// AI caller can be found and hooked next.
+static bool IsAIDecision(const std::string& n) {
+  static const char* k[] = {"BecomeAggressive", "BecomePassive", "SetBusy", "SetShouldRun", "PlaySpeech",
+                            "RemoveUnreachableTarget", "HandleAIAttackNotification", "IsTargetToAttackOnSight",
+                            "BeginFiring", "AddForcedEnemy", "SetDoorPawnIsIn", "InterruptCurrentAction"};
+  for (const char* x : k) if (n == x) return true;
+  return false;
+}
+extern "C" REX_FUNC(sub_82480E00) {
+  if (g_trace.load()) {
+    if (const char* tag = TraceTag(base, ctx.r3.u32)) {
+      PPCContext k = ctx;
+      uint32_t fn = ctx.r6.u32;
+      TraceNote(ctx, base, "call", tag, fn);
+      if (BsP2KeyboardActive()) {
+        std::string name;
+        { std::lock_guard<std::mutex> lk(g_tr_mu); auto it = g_tr_names.find(fn); if (it != g_tr_names.end()) name = it->second; }
+        if (!name.empty() && IsAIDecision(name)) {
+          Probe((std::string("ai.decision.") + name).c_str(), base, k, "", 2);
+          LearnFreeze(ctx, base, name.c_str(), true);
+        }
+      }
+      ctx = k;
+    }
+  }
+  __imp__sub_82480E00(ctx, base);
+}
+// sub_8247E270 is the bytecode runner. Its tracer hook was removed (guessing whether r4 was a function
+// or a frame crashed twice). It IS hooked for one exact case: the actor Tick (sub_82302E20) calls it
+// through vtable+20 with the frame time in f1 to step the actor's STATE CODE (latent "attack, wait,
+// move" sequences). That call returns to 0x82302E5C. Skipping it for your Big Daddy's AI controller
+// while you drive freezes the AI's decision loop (BeginFiring / SetBusy / SetShouldRun come from there)
+// without touching script calls, events or params. Address compare only: no lookups.
+std::atomic<bool> g_p2_freeze_ai{true}, g_p2_freeze_pawn{true};
+void BsP2FreezeAI(bool ctl, bool pawn) { g_p2_freeze_ai = ctl; g_p2_freeze_pawn = pawn; }
+extern "C" void __imp__sub_8247E270(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" REX_FUNC(sub_8247E270) {
+  if (uint32_t(ctx.lr) != 0x82302E5Cu) { __imp__sub_8247E270(ctx, base); return; }
+  if (BsP2KeyboardActive() && IsLearnedFrozen(ctx.r3.u32)) {
+    static uint32_t s_l = 0;
+    if ((++s_l % 600) == 1) REXLOG_INFO("bioshock-recomp: give: P2: learned AI state code frozen ({} ticks skipped)", s_l);
+    return;
+  }
+  if (BsP2KeyboardActive()) {
+    uint32_t p2 = g_p2.load(), self = ctx.r3.u32;
+    if (p2 && InHeap(p2) && self) {
+      const bool is_ctl = self == BE32(base, p2 + 0x420), is_pawn = self == p2;
+      // Which object steps state code here (recon: the controller never showed up, 2026-11-03).
+      static uint32_t s_seen_ctl = 0, s_seen_pawn = 0;
+      if (is_ctl) ++s_seen_ctl;
+      if (is_pawn) ++s_seen_pawn;
+      // His body's state code also plays death: never freeze it once he is down.
+      uint32_t hv = BE32(base, p2 + 1356); float hp; std::memcpy(&hp, &hv, 4);
+      if ((g_p2_freeze_ai.load() && is_ctl) || (g_p2_freeze_pawn.load() && is_pawn && hp > 0.0f)) {
+        static uint32_t s_n = 0;
+        if ((++s_n % 600) == 1)
+          REXLOG_INFO("bioshock-recomp: give: P2: AI state code frozen ({} ticks skipped; seen controller {} body {})", s_n,
+                      s_seen_ctl, s_seen_pawn);
+        return;
+      }
+    }
+  }
+  uint32_t prev_owner = t_state_owner;
+  t_state_owner = ctx.r3.u32;
+  __imp__sub_8247E270(ctx, base);
+  t_state_owner = prev_owner;
+}
+
+// ---- Native AI think. AActor::Tick (sub_82302F68) calls the AI pawn's virtual tick (vtable+432,
+// sub_825786A8), which ends in sub_8258E290(this, f1 dt): perception (sub_8257F5C0, sub_8258D9E8),
+// behaviour (sub_82584DE0) and the AI message dispatcher (sub_8250F9E8) that fires BecomeAggressive /
+// SetShouldRun / BeginFiring / AddForcedEnemy into script (decision probes, 2026-11-03). Skipped for
+// your Big Daddy while you drive; runs normally at 0 health so death is handled.
+std::atomic<bool> g_p2_freeze_think{true};
+void BsP2FreezeThink(bool on) { g_p2_freeze_think = on; }
+extern "C" void __imp__sub_8258E290(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" REX_FUNC(sub_8258E290) {
+  if (g_p2_freeze_think.load() && BsP2KeyboardActive()) {
+    uint32_t p2 = g_p2.load();
+    if (p2 && ctx.r3.u32 == p2 && InHeap(p2)) {
+      uint32_t hv = BE32(base, p2 + 1356); float hp; std::memcpy(&hp, &hv, 4);
+      if (hp > 0.0f) {
+        static uint32_t s_n = 0;
+        if ((++s_n % 600) == 1) REXLOG_INFO("bioshock-recomp: give: P2: native AI think skipped ({} ticks)", s_n);
+        return;
+      }
+    }
+  }
+  __imp__sub_8258E290(ctx, base);
 }

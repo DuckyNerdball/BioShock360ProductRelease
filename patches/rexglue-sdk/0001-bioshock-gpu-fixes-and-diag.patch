@@ -719,6 +719,68 @@ index 813bb1c..972f9da 100644
  void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment) {
    assignment_ = std::move(assignment);
    if (assignment_) {
+diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
+index 8778066..4ba04b8 100644
+--- a/src/kernel/xam/xam_user.cpp
++++ b/src/kernel/xam/xam_user.cpp
+@@ -12,6 +12,7 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <unordered_set>
+ #include <cstring>
+ 
+ #include <rex/cvar.h>
+@@ -351,11 +352,46 @@ u32 XamUserWriteProfileSettings_entry(u32 title_id, u32 user_index, u32 setting_
+         user_profile->AddSetting(
+             std::make_unique<xam::UserProfile::BinarySetting>(setting.setting_id, bytes));
+       } break;
+-      case UserProfile::Setting::Type::WSTRING:
+-      case UserProfile::Setting::Type::DOUBLE:
+-      case UserProfile::Setting::Type::FLOAT:
++      // bioshock-recomp: numeric settings were dropped ("Unimplemented data type 1", 500+ per
++      // session), so option changes did not stick. Update in place when the setting exists, else add
++      // it in memory. Title-specific numeric settings are never added (AddSetting would write an
++      // empty file to disk: numeric settings have no serializer).
+       case UserProfile::Setting::Type::INT32:
+       case UserProfile::Setting::Type::INT64:
++      case UserProfile::Setting::Type::FLOAT:
++      case UserProfile::Setting::Type::DOUBLE: {
++        static std::unordered_set<uint32_t> s_logged;
++        const uint32_t id = setting.setting_id;
++        if (s_logged.insert(id).second) {
++          REXKRNL_INFO("XamUserWriteProfileSettings: setting {:08X} type {} (numeric, kept in memory)", id,
++                       setting.data.type);
++        }
++        auto* cur = user_profile->GetSetting(id);
++        if (cur && cur->type == setting_type) {
++          switch (setting_type) {
++            case UserProfile::Setting::Type::INT32:
++              static_cast<UserProfile::Int32Setting*>(cur)->value = setting.data.s32; break;
++            case UserProfile::Setting::Type::INT64:
++              static_cast<UserProfile::Int64Setting*>(cur)->value = setting.data.s64; break;
++            case UserProfile::Setting::Type::FLOAT:
++              static_cast<UserProfile::FloatSetting*>(cur)->value = setting.data.f32; break;
++            default:
++              static_cast<UserProfile::DoubleSetting*>(cur)->value = setting.data.f64; break;
++          }
++        } else if (!cur && (id & 0x3F00) != 0x3F00) {
++          switch (setting_type) {
++            case UserProfile::Setting::Type::INT32:
++              user_profile->AddSetting(std::make_unique<UserProfile::Int32Setting>(id, setting.data.s32)); break;
++            case UserProfile::Setting::Type::INT64:
++              user_profile->AddSetting(std::make_unique<UserProfile::Int64Setting>(id, setting.data.s64)); break;
++            case UserProfile::Setting::Type::FLOAT:
++              user_profile->AddSetting(std::make_unique<UserProfile::FloatSetting>(id, setting.data.f32)); break;
++            default:
++              user_profile->AddSetting(std::make_unique<UserProfile::DoubleSetting>(id, setting.data.f64)); break;
++          }
++        }
++      } break;
++      case UserProfile::Setting::Type::WSTRING:
+       case UserProfile::Setting::Type::DATETIME:
+       default: {
+         REXKRNL_ERROR("XamUserWriteProfileSettings: Unimplemented data type {}", setting_type);
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 index 1254710..5019175 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp

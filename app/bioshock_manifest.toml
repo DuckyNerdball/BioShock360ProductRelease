@@ -61,3 +61,5 @@ includes = []
 "0x827DF4D0" = {}
 # 2026-11-01: indirect-call target found at runtime (playersonly / Testing overlay)
 "0x82301D18" = {}
+# 2026-11-03: indirect-call target found at runtime (Big Daddy co-op, new area of Medical)
+"0x823A9670" = {}

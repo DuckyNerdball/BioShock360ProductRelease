@@ -379,18 +379,26 @@ bool BsPadPollIndex(int i, uint16_t* buttons, int16_t* lx, int16_t* ly, int16_t*
 
 // Keyboard/mouse for the P2 puppet (polled directly, works while the game's input is blocked).
 bool BsKeyDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
-// Horizontal mouse movement since the last call; re-centres the cursor while our window is focused.
+// Horizontal mouse movement since the last call; re-centres the cursor while one of our windows is
+// focused. Hold Alt (or open F9) to free the cursor: switch windows, click the panel. On recapture the
+// first frame only re-centres, so the camera does not jump.
+bool BsPanelIsOpen();  // give.cpp
 int BsMouseDX() {
+  extern int g_mouse_dy_bs;
+  static bool s_free = true;
   HWND fg = GetForegroundWindow();
   DWORD pid = 0;
   GetWindowThreadProcessId(fg, &pid);
-  if (!fg || pid != GetCurrentProcessId()) return 0;
+  if (!fg || pid != GetCurrentProcessId() || (GetAsyncKeyState(VK_MENU) & 0x8000) || BsPanelIsOpen()) {
+    s_free = true; g_mouse_dy_bs = 0; return 0;
+  }
   RECT r; GetClientRect(fg, &r);
   POINT c{(r.right - r.left) / 2, (r.bottom - r.top) / 2};
   ClientToScreen(fg, &c);
   POINT p; GetCursorPos(&p);
   SetCursorPos(c.x, c.y);
-  extern int g_mouse_dy_bs; g_mouse_dy_bs = p.y - c.y;
+  if (s_free) { s_free = false; g_mouse_dy_bs = 0; return 0; }
+  g_mouse_dy_bs = p.y - c.y;
   return p.x - c.x;
 }
 int g_mouse_dy_bs = 0;

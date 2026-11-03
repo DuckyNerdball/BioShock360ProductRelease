@@ -15,6 +15,7 @@ set(BIOSHOCK_SOURCES
     src/main.cpp
     src/cheats.cpp
     src/give.cpp
+    src/crash_trace.cpp
 )
 
 if(WIN32)
@@ -24,4 +25,7 @@ else()
 endif()
 
 rexglue_setup_target(bioshock GPU_PLUGINS xenos)
+if(WIN32)
+    target_link_libraries(bioshock PRIVATE dbghelp)  # crash_trace.cpp: symbolized crash stacks
+endif()
 
