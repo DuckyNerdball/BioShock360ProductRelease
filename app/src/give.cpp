@@ -8,6 +8,10 @@
 #include <rex/logging.h>
 #include <rex/graphics/split_view.h>
 #include <functional>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
 #include <rex/system/xthread.h>
@@ -37,6 +41,10 @@ extern "C" void __imp__sub_82548290(PPCContext& __restrict ctx, uint8_t* base); 
 extern "C" void __imp__sub_82462F60(PPCContext& __restrict ctx, uint8_t* base);  // StaticFindObject(Class|0, Outer, Name, Exact)
 extern "C" void __imp__sub_821C5028(PPCContext& __restrict ctx, uint8_t* base);  // FindObject(ANY_PACKAGE=-1, Name, 0) -> UClass*
 extern "C" void __imp__sub_821CE930(PPCContext& __restrict ctx, uint8_t* base);  // AActor::SetCollisionSize(f1 radius, f2 height)
+extern "C" void __imp__sub_824BCC80(PPCContext& __restrict ctx, uint8_t* base);  // UInventoryManager::OpenContainer(container)
+extern "C" void __imp__sub_824BE9A0(PPCContext& __restrict ctx, uint8_t* base);  // UInventoryManager::SelectAllContainerSlots()
+extern "C" void __imp__sub_824BC4D0(PPCContext& __restrict ctx, uint8_t* base);  // UInventoryManager::CloseContainer()
+extern "C" void __imp__sub_8247FFB0(PPCContext& __restrict ctx, uint8_t* base);  // UObject::ProcessEvent(this, UFunction*, Parms) - found 2026-11-03 (every native->script event enters here; return addr 824801C4)
 extern "C" void __imp__sub_822A0870(PPCContext& __restrict ctx, uint8_t* base);  // FindField(UClass*, PropName) -> UProperty*
 extern "C" void __imp__sub_821640E8(PPCContext& __restrict ctx, uint8_t* base);  // FString::FString(const TCHAR*)
 extern "C" void __imp__sub_821B07A0(PPCContext& __restrict ctx, uint8_t* base);  // TFieldIterator<UProperty>::IterateToNext
@@ -148,11 +156,17 @@ uint32_t FindUClass(uint8_t* base) {
 }  // namespace
 void BsSetProbe(bool on) { g_probe = on; }  // outside the anonymous namespace: called from the panel
 
+std::atomic<bool> g_level_changing{false};
+void BsLevelChanging(bool on) {
+  if (on && !g_level_changing.load()) REXLOG_INFO("bioshock-recomp: give: level change - P2 ticks paused until the new player is captured");
+  g_level_changing = on;
+}
 namespace {
 bool InHeap(uint32_t a) { return a >= 0x40000000 && a < 0x5F000000; }
 void CapturePlayer(uint32_t p) {
   if (!InHeap(p) || g_player.load() == p) return;
   g_player = p;
+  g_level_changing = false;
   // New player = level/save load: everything cached from the old level is freed memory now.
   g_invmgr = 0;
   g_gameinfo = 0;
@@ -215,7 +229,7 @@ void BsTickP2(PPCContext& ctx, uint8_t* base);
 void BsPollPadSpawnCombo();
 void BsRunGives(PPCContext& ctx, uint8_t* base) {
   BsPollPadSpawnCombo();
-  BsTickP2(ctx, base);
+  if (!g_level_changing.load()) BsTickP2(ctx, base);
   std::string cls;
   {
     std::lock_guard<std::mutex> lk(g_gmu);
@@ -624,6 +638,13 @@ std::string FNameStr(PPCContext& ctx, uint8_t* base, uint32_t obj, uint32_t sp) 
   for (uint32_t i = 0; d && i < n && i < 80; ++i) { uint8_t c = base[d + 2 * i + 1]; if (!c) break; o += char(c); }
   return o;
 }
+// Class names never change: cache them (FNameStr allocates a guest FString it never frees).
+std::string ClassNameCached(PPCContext& ctx, uint8_t* base, uint32_t cls, uint32_t sp) {
+  static std::unordered_map<uint32_t, std::string> s_names;
+  auto it = s_names.find(cls);
+  if (it != s_names.end()) return it->second;
+  return s_names.emplace(cls, FNameStr(ctx, base, cls, sp)).first->second;
+}
 bool ShouldDouble(PPCContext& ctx, uint8_t* base, uint32_t cls, uint32_t sp) {
   if (auto it = g_ai_class.find(cls); it != g_ai_class.end()) return it->second;
   bool pawn = false, skip = false;
@@ -665,13 +686,18 @@ int BsGetViewMode() { return g_view_mode.load(); }
 std::atomic<uint32_t> g_cam_actor{0}, g_cam_class{0};
 std::atomic<bool> g_cam_want{false};
 std::atomic<bool> g_split_default{true};   // spawning P2 (D-pad x5 / triple F8) opens co-op split
-std::atomic<bool> g_jack_body{false};
-std::atomic<bool> g_p2_blind{true};
-std::atomic<bool> g_p2_squeeze{true};      // while you drive: collision radius shrunk to about Jack's        // while you drive: clear P2's AI Enemy/Focus every tick
+std::atomic<bool> g_jack_body{false};      // experimental: give Jack a Splicer mesh in the P2 view
+std::atomic<bool> g_p2_blind{true};         // while you drive: clear P2's AI Enemy/Focus every tick
+std::atomic<bool> g_p2_squeeze{true};       // while you drive: collision radius shrunk to about Jack's
+static std::chrono::steady_clock::time_point g_charge_until{};  // walk anims leave channel 0 alone while charging
+std::atomic<bool> g_p2_as_player{true};    // while you drive: script IsPlayer() says yes for him (enemies hunt him like Jack)
+std::atomic<float> g_hud_hp{0.0f}, g_hud_max{0.0f};  // for the Big Daddy HUD (drawn on the UI thread)
+static float g_cam_shake = 0.0f;           // Big Daddy camera shake amplitude (units), decays per frame
 std::atomic<uint32_t> g_p2_yaw_of{0};      // pawn whose facing we own (0 = re-read from the pawn)
-std::atomic<uint32_t> g_ai_swings{0};      // AI-started weapon calls on P2 while you drive      // experimental: give Jack a Splicer mesh in the P2 view
+std::atomic<uint32_t> g_ai_swings{0};      // AI-started weapon calls on P2 while you drive
 // Split view (two windows): the app installs the window opener; the frame tag lives in the SDK.
 std::function<void(bool)> g_split_window_fn;
+std::function<void(bool)> g_focus_window_fn;  // UI: focus the Big Daddy (true) or main (false) window
 void BsSplitWindow(bool on) {
   if (on) g_view_mode = 1;  // alternate frames
   else if (g_view_mode.load() == 1) g_view_mode = 0;
@@ -679,26 +705,49 @@ void BsSplitWindow(bool on) {
   if (g_split_window_fn) g_split_window_fn(on);
 }
 bool BsCoopSplit() { return rex::graphics::split_view::state().enabled.load(); }
-void BsSplitInvert(bool inv) { rex::graphics::split_view::state().invert = inv; }
-bool BsSplitInverted() { return rex::graphics::split_view::state().invert.load(); }
+// F7: window 2 always shows the Big Daddy (and his HUD). If the views ever land on the wrong windows, the
+// frame labels are off by one; F7 flips the labels so the views trade places and the HUD stays put.
+std::atomic<bool> g_label_fix{false};
+static auto g_label_manual_t = std::chrono::steady_clock::now() - std::chrono::hours(1);
+void BsSplitInvert(bool inv) {
+  g_label_manual_t = std::chrono::steady_clock::now();  // manual F7 wins over the auto check for a minute
+  g_label_fix = inv;
+  rex::graphics::split_view::state().invert = false;
+  rex::graphics::split_view::ResetFrameQueue();
+  Log(inv ? "split: views relabeled (F7) - Big Daddy view back on window 2" : "split: view labels back to normal (F7)");
+}
+bool BsSplitInverted() { return g_label_fix.load(); }
 // Co-op: which player the controller (pad 0) drives. Back / F6 flips it, and the views swap so the
 // player you are holding the controller for is always in the main window.
 std::atomic<bool> g_pad_p2{false};
+std::atomic<bool> g_bd_in_main{false};  // (unused by the HUD now; kept for logs)
+// HUD side: which window shows the Big Daddy cannot be read back (frame parity between the game and
+// present threads varies per session), but Back/F6 and F7 all flip `invert`, exactly like the views.
+// So the HUD follows invert, and F5 flips a per-session correction if it starts on the wrong window.
+std::atomic<bool> g_hud_flip{false};
+bool BsBdInMain() { return rex::graphics::split_view::state().invert.load() != g_hud_flip.load(); }
+void BsHudFlip() { g_hud_flip = !g_hud_flip.load(); Log("HUD moved to the other window (F5)"); }
 bool BsPadOnP2() { return g_pad_p2.load() && BsCoopSplit(); }
 void BsPadSwap() {
   if (!BsCoopSplit() || !g_p2.load()) { Log("Controller swap: only in co-op split (spawn a Big Daddy first)"); return; }
   bool to_p2 = !g_pad_p2.load();
   g_pad_p2 = to_p2;
   if (to_p2) g_p2_kbd = true;  // the Big Daddy has to be in driven mode for any input to reach him
-  auto& sv = rex::graphics::split_view::state();
-  sv.invert = !sv.invert.load();  // relative flip, so a manual F7 correction is kept
-  Log(to_p2 ? "Controller -> Big Daddy (his view is now the main window). Back / F6 = back to Jack"
-            : "Controller -> Jack (main window). Back / F6 = Big Daddy");
+  // Views stay put: window 2 is always the Big Daddy (his HUD with it). Moving views between windows on
+  // every swap is what kept scrambling windows and HUD (2026-11-03). Back only moves the controller and
+  // brings the driven player's window to the front. F7 still swaps the views by hand.
+  g_bd_in_main = false;
+  if (g_focus_window_fn) g_focus_window_fn(to_p2);
+  Log(to_p2 ? "Controller -> Big Daddy (his window brought to front). Back / F6 = back to Jack"
+            : "Controller -> Jack (main window brought to front). Back / F6 = Big Daddy");
 }
 void BsSplitDefault(bool on) { g_split_default = on; }
 void BsJackBody(bool on) { g_jack_body = on; }
 void BsP2Blind(bool on) { g_p2_blind = on; }
 void BsP2Squeeze(bool on) { g_p2_squeeze = on; }
+void BsP2AsPlayer(bool on) { g_p2_as_player = on; }
+// HUD: true while a P2 Big Daddy exists; health and max health.
+bool BsP2HudData(float* hp, float* mx) { *hp = g_hud_hp.load(); *mx = g_hud_max.load(); return g_p2.load() != 0; }
 std::string BsSplitStats() {
   namespace sv = rex::graphics::split_view;
   return fmt::format("frames: main {}  P2 window {}", sv::state().frames_routed[0].load(), sv::state().frames_routed[1].load());
@@ -713,7 +762,9 @@ bool BsP2KeyboardActive() { return g_p2_kbd.load() && g_p2.load(); }
 std::atomic<bool> g_p2_autoswitch{false};
 bool BsPadPollIndex(int i, uint16_t* buttons, int16_t* lx, int16_t* ly, int16_t* rx, int16_t* ry, uint8_t* rt);
 // Spawn a Big Daddy and put you in control of him (triple F8, or D-pad down x5 on the controller).
+std::atomic<bool> g_p2_keep{false};  // a quick-spawned Big Daddy: bring him back after a reload / Jack's death
 void BsP2QuickSpawn(const char* why) {
+  g_p2_keep = true;
   if (g_p2_kbd.load()) BsQueueCommand("viewself"), BsQueueCommand("behindview 0");
   g_p2_kbd = false;
   g_p2_detach = false; g_p2_view = "SpawnedBouncer"; g_p2_want = true; g_p2_autoswitch = true;
@@ -778,6 +829,18 @@ void BsP2Request(bool detach, std::string view) { g_p2_detach = detach; g_p2_wan
 void BsP2Release() { if (g_p2_kbd.load()) BsP2ToggleKeyboard(); g_p2 = 0; }
 uint32_t BsP2Pawn() { return g_p2.load(); }
 // Level actor list: a player pointer field -> ULevel whose Actors TArray contains the player.
+// InHeap is only an address-range check; the guest heap is reserved, not fully committed, and a freed level's
+// arrays are decommitted. Check the host pages before scanning a big array (crash at guest 0x56010000).
+static bool HostReadable(const uint8_t* p, size_t len) {
+  MEMORY_BASIC_INFORMATION mbi{};
+  const uint8_t* end = p + len;
+  while (p < end) {
+    if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+    p = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+  }
+  return true;
+}
 static bool FindActorList(uint8_t* base, uint32_t player, uint32_t* data, uint32_t* num) {
   static uint32_t s_pf = 0, s_af = 0;
   auto tryPair = [&](uint32_t pf, uint32_t af) {
@@ -785,6 +848,7 @@ static bool FindActorList(uint8_t* base, uint32_t player, uint32_t* data, uint32
     if (!InHeap(lv)) return false;
     uint32_t d = BE32(base, lv + af), n = BE32(base, lv + af + 4), mx = BE32(base, lv + af + 8);
     if (!InHeap(d) || n < 10 || n > 100000 || mx < n || mx > 400000) return false;
+    if (!InHeap(d + 4 * n) || !HostReadable(base + d, size_t(4) * n)) return false;  // freed / never committed
     for (uint32_t i = 0; i < n; ++i)
       if (BE32(base, d + 4 * i) == player) { *data = d; *num = n; s_pf = pf; s_af = af; return true; }
     return false;
@@ -887,6 +951,120 @@ static void SetBool(PPCContext& ctx, uint8_t* base, uint32_t obj, const char* na
   v = on ? (v | mask) : (v & ~mask);
   base[obj + off] = uint8_t(v >> 24); base[obj + off + 1] = uint8_t(v >> 16); base[obj + off + 2] = uint8_t(v >> 8); base[obj + off + 3] = uint8_t(v);
 }
+// --- Script calls from C++ -------------------------------------------------------------------------
+// FindFunction: the same field lookup as FindPropOffset, checked to be a UFunction. Cached per class+name.
+// UStruct::Children / UField::Next: calibrated by finding the field lists that contain the known UProperty
+// for "Location". Two sessions picked different Children offsets (+64, +A0) and OnUsed was never found, so
+// every matching (children, next) pair is kept and FindFunction tries them all.
+static std::vector<std::pair<int, int>> g_field_lists;
+static bool CalibrateFieldLists(PPCContext& ctx, uint8_t* base, uint32_t cls) {
+  if (!g_field_lists.empty()) return true;
+  static int s_tries = 0;
+  if (++s_tries > 5) return false;
+  PPCContext saved = ctx;
+  uint32_t sp = (ctx.r1.u32 - 0x7C00) & ~0xFu, str = sp + 0x2000;
+  const char* nm = "Location";
+  for (size_t i = 0; i < 8; ++i) { base[str + 2 * i] = 0; base[str + 2 * i + 1] = uint8_t(nm[i]); }
+  base[str + 16] = base[str + 17] = 0;
+  ctx.r1.u64 = sp; ctx.r3.u64 = cls; ctx.r4.u64 = str;
+  __imp__sub_822A0870(ctx, base);
+  uint32_t target = ctx.r3.u32;
+  ctx = saved;
+  if (!target) return false;
+  for (uint32_t c = cls, k = 0; c && HeapOrImg(c) && k < 16; c = BE32(base, c + 0x38), ++k)
+    for (int co = 0x3C; co <= 0xC0; co += 4)
+      for (int no : {0x30, 0x34, 0x38, 0x3C, 0x40}) {
+        if (no == co) continue;
+        uint32_t f = BE32(base, c + co);
+        bool hit = false;
+        for (int j = 0; j < 4000 && f && HeapOrImg(f) && !hit; ++j, f = BE32(base, f + no)) hit = f == target;
+        if (hit && std::find(g_field_lists.begin(), g_field_lists.end(), std::make_pair(co, no)) == g_field_lists.end())
+          g_field_lists.push_back({co, no});
+      }
+  std::string l;
+  for (auto& pr : g_field_lists) l += fmt::format(" (Children +{:X}, Next +{:X})", pr.first, pr.second);
+  Log(g_field_lists.empty() ? std::string("script: field list calibration failed") : "script: field lists calibrated:" + l);
+  return !g_field_lists.empty();
+}
+// Functions seen being called (world watch) by name; used when the field walk misses (state functions etc).
+static std::mutex g_learn_mu;
+static std::unordered_map<std::string, std::vector<uint32_t>> g_learned_fn;
+static void LearnFunction(const std::string& name, uint32_t fn) {
+  std::lock_guard<std::mutex> lk(g_learn_mu);
+  auto& v = g_learned_fn[name];
+  if (std::find(v.begin(), v.end(), fn) == v.end() && v.size() < 16) v.push_back(fn);
+}
+// FindFunction: obj's class chain, each class's own fields by name, first UFunction wins; then functions of
+// that name already seen in play whose Outer is a class in obj's chain. Cached per class+name.
+static uint32_t FindFunction(PPCContext& ctx, uint8_t* base, uint32_t obj, const char* name) {
+  uint32_t cls = BE32(base, obj + 0x2C);
+  if (!InHeap(cls) && !(cls >= 0x82000000 && cls < 0x83000000)) return 0;
+  static std::mutex mu; static std::unordered_map<uint64_t, uint32_t> cache;
+  uint64_t key = (uint64_t(cls) << 32) ^ std::hash<std::string>{}(name);
+  { std::lock_guard<std::mutex> lk(mu); auto it = cache.find(key); if (it != cache.end() && it->second) return it->second; }
+  if (!CalibrateFieldLists(ctx, base, cls)) return 0;
+  PPCContext saved = ctx;
+  uint32_t sp = (ctx.r1.u32 - 0x5000) & ~0xFu, found = 0;
+  std::vector<uint32_t> chain;
+  for (uint32_t c = cls, k = 0; c && HeapOrImg(c) && k < 16; c = BE32(base, c + 0x38), ++k) chain.push_back(c);
+  for (auto& pr : g_field_lists) {
+    for (uint32_t c : chain) {
+      uint32_t f = BE32(base, c + pr.first);
+      for (int j = 0; j < 4000 && f && HeapOrImg(f) && !found; ++j, f = BE32(base, f + pr.second)) {
+        if (FNameStr(ctx, base, f, sp) != name) { ctx = saved; continue; }
+        ctx = saved;
+        std::string fc = ClassNameCached(ctx, base, BE32(base, f + 0x2C), sp);
+        ctx = saved;
+        if (fc.find("Function") != std::string::npos) found = f;
+      }
+      if (found) break;
+    }
+    if (found) break;
+  }
+  if (!found) {
+    std::lock_guard<std::mutex> lk(g_learn_mu);
+    auto it = g_learned_fn.find(name);
+    if (it != g_learned_fn.end())
+      for (uint32_t f : it->second) {
+        for (int o = 0x10; o <= 0x28 && !found; o += 4)
+          if (std::find(chain.begin(), chain.end(), BE32(base, f + o)) != chain.end()) found = f;
+        if (found) break;
+      }
+  }
+  ctx = saved;
+  if (!found) {
+    static int s_miss = 0;
+    if (++s_miss <= 12) Log(fmt::format("script: no function '{}' on {}", name, ClassNameCached(ctx, base, cls, sp)));
+    ctx = saved;
+  }
+  std::lock_guard<std::mutex> lk(mu);
+  cache[key] = found;  // misses are retried (see above): a later-learned function can fill them
+  return found;
+}
+extern std::atomic<bool> g_in_p2_move;
+// CallEvent: obj.Name(args...) through ProcessEvent, like the engine's own eventXxx() wrappers.
+// Args are 4-byte values in declaration order (object refs, ints, bools as 0/1). Returns false if obj has
+// no such function or its parameter block is not what we fill. as_p2 = the Big Daddy is the one acting,
+// so the scoped "is a player / may open doors / meets criteria" answers apply during the call.
+static bool CallEvent(PPCContext& ctx, uint8_t* base, uint32_t obj, const char* name, std::initializer_list<uint32_t> args, bool as_p2 = false) {
+  if (!InHeap(obj)) return false;
+  uint32_t fn = FindFunction(ctx, base, obj, name);
+  if (!fn) return false;
+  uint32_t parms_size = (uint32_t(base[fn + 146]) << 8) | base[fn + 147];
+  if (parms_size > 256 || parms_size < 4 * args.size()) return false;
+  PPCContext saved = ctx;
+  uint32_t sp = (ctx.r1.u32 - 0x6800) & ~0xFu, parms = sp + 0x400;
+  std::memset(base + parms, 0, 0x110);
+  uint32_t o = 0;
+  for (uint32_t v : args) { base[parms + o] = uint8_t(v >> 24); base[parms + o + 1] = uint8_t(v >> 16); base[parms + o + 2] = uint8_t(v >> 8); base[parms + o + 3] = uint8_t(v); o += 4; }
+  ctx.r1.u64 = sp; ctx.r3.u64 = obj; ctx.r4.u64 = fn; ctx.r5.u64 = parms;
+  const bool prev = g_in_p2_move.load();
+  if (as_p2) g_in_p2_move = true;
+  __imp__sub_8247FFB0(ctx, base);
+  g_in_p2_move = prev;
+  ctx = saved;
+  return true;
+}
 // Hide/show Jack and everything he owns (first-person arms/weapon) while you play as P2.
 static void HideJack(PPCContext& ctx, uint8_t* base, bool hide) {
   uint32_t pl = g_player.load();
@@ -987,14 +1165,27 @@ static void BsCamTick(PPCContext& ctx, uint8_t* base, uint32_t p) {
     if (odd) {
       if (g_p2_kbd.load()) s_bd_pitch = std::clamp(s_bd_pitch - BsMouseDY() * 40 + (g_pad_p2.load() ? int(g_pad_pitch / 32767.0f * 300.0f) : 0), -11000, 5000);
       if (cam_ok) {
-        // Orbit camera: 330 units behind the Big Daddy's head, looking along his facing.
+        // Orbit camera behind the Big Daddy's head, looking along his facing. Player feel: the position
+        // eases toward its target (weighty follow), pulls in during a charge, and shakes on impacts.
         const float k = 6.2831853f / 65536.0f;
         int32_t yaw = int32_t(BE32(base, p + 0x1D0));
         float yr = yaw * k, pr = s_bd_pitch * k;
         float fx = std::cos(pr) * std::cos(yr), fy = std::cos(pr) * std::sin(yr), fz = std::sin(pr);
+        static float s_dist = 330.0f;
+        s_dist += ((std::chrono::steady_clock::now() < g_charge_until ? 245.0f : 330.0f) - s_dist) * 0.12f;
         float tx = getf(p + 0x1C0), ty = getf(p + 0x1C4), tz = getf(p + 0x1C8) + 95.0f;
-        putf(cam + 0x1C0, tx - fx * 330.0f); putf(cam + 0x1C4, ty - fy * 330.0f); putf(cam + 0x1C8, tz - fz * 330.0f + 25.0f);
-        put(cam + 0x1CC, uint32_t(s_bd_pitch)); put(cam + 0x1D0, uint32_t(yaw)); put(cam + 0x1D4, 0);
+        float wx = tx - fx * s_dist, wy = ty - fy * s_dist, wz = tz - fz * s_dist + 25.0f;
+        static float s_cx = 0, s_cy = 0, s_cz = 0; static bool s_init = false;
+        float jx = wx - s_cx, jy = wy - s_cy, jz = wz - s_cz;
+        if (!s_init || jx * jx + jy * jy + jz * jz > 800.0f * 800.0f) { s_cx = wx; s_cy = wy; s_cz = wz; s_init = true; }
+        else { s_cx += jx * 0.35f; s_cy += jy * 0.35f; s_cz += jz * 0.35f; }
+        static uint32_t s_rng = 12345u;
+        auto rnd = [&]() { s_rng = s_rng * 1664525u + 1013904223u; return float(s_rng >> 8) / float(1u << 24) * 2.0f - 1.0f; };
+        float sh = g_cam_shake;
+        g_cam_shake *= 0.86f;
+        if (g_cam_shake < 0.05f) g_cam_shake = 0.0f;
+        putf(cam + 0x1C0, s_cx + rnd() * sh); putf(cam + 0x1C4, s_cy + rnd() * sh); putf(cam + 0x1C8, s_cz + rnd() * sh);
+        put(cam + 0x1CC, uint32_t(s_bd_pitch + int32_t(rnd() * sh * 25.0f))); put(cam + 0x1D0, uint32_t(yaw + int32_t(rnd() * sh * 15.0f))); put(cam + 0x1D4, 0);
         put(pc + 0x5F0, cam);
         base[pc + 0x564] &= uint8_t(~0x04);  // behind-view off: camera = ViewTarget's own location/rotation
       } else {
@@ -1005,7 +1196,18 @@ static void BsCamTick(PPCContext& ctx, uint8_t* base, uint32_t p) {
       put(pc + 0x5F0, pl);
       base[pc + 0x564] &= uint8_t(~0x04);
     }
-    rex::graphics::split_view::state().current_view = odd ? 1u : 0u;  // stamped into this frame's swap
+    rex::graphics::split_view::state().current_view = odd ? 1u : 0u;
+    // Queue this frame's view; VdSwap pops it when the (lagging) render thread presents this frame.
+    // A big gap between ticks (load, hitch) restarts the queue so stale views can't shift the mapping.
+    {
+      static auto s_last_tick = std::chrono::steady_clock::now();
+      auto t = std::chrono::steady_clock::now();
+      if (t - s_last_tick > std::chrono::milliseconds(300)) rex::graphics::split_view::ResetFrameQueue();
+      s_last_tick = t;
+    }
+    // Always push (VdSwap always pops): a 1:1 label stream from the first frame, so turning routing on
+    // can never leave a pending frame unlabeled (that shifted every later label by one).
+    rex::graphics::split_view::PushFrameView((odd ? 1u : 0u) ^ (g_label_fix.load() ? 1u : 0u));
     static auto s_t0 = std::chrono::steady_clock::now(); static uint32_t s_n0 = 0;
     auto now = std::chrono::steady_clock::now();
     if (now - s_t0 > std::chrono::seconds(5)) {
@@ -1094,6 +1296,10 @@ static uint32_t FindClassByName(PPCContext& ctx, uint8_t* base, const std::strin
   return c;
 }
 
+static std::string FNameAtAddr(PPCContext& ctx, uint8_t* base, uint32_t addr, uint32_t sp);
+static std::vector<uint32_t> g_p2_looted;  // containers already emptied by the Big Daddy
+std::atomic<bool> g_jack_got{false};  // set by the ProcessEvent hook when Jack receives an item / log entry
+static std::vector<uint32_t> g_p2_switched;  // switches already used
 static void BsP2Use(PPCContext& ctx, uint8_t* base, uint32_t p) {
   uint32_t pl = g_player.load(), d = 0, n = 0;
   if (!InHeap(pl) || !FindActorList(base, pl, &d, &n)) { Log("P2 use: level actor list not found"); return; }
@@ -1104,7 +1310,10 @@ static void BsP2Use(PPCContext& ctx, uint8_t* base, uint32_t p) {
   uint32_t sp = (ctx.r1.u32 - 0x5000) & ~0xFu, best = 0;
   float bestd = 230.0f * 230.0f;  // Big Daddy reach
   std::string bestcn;
-  std::vector<std::pair<float, std::string>> near;  // recon: what IS in reach when nothing matches
+  std::vector<std::pair<float, std::string>> near_list;  // recon: what IS in reach when nothing matches
+  uint32_t best_container = 0;                      // set when the nearest lootable is a container
+  uint32_t best_switch = 0; std::string best_switch_ev, best_switch_cn;
+  std::vector<std::pair<float, uint32_t>> usable;  // non-pickup, non-noise actors in reach (switches weighted closer)
   for (uint32_t i = 0; i < n; ++i) {
     uint32_t a = BE32(base, d + 4 * i);
     if (!InHeap(a) || a == p || a == pl) continue;
@@ -1112,24 +1321,119 @@ static void BsP2Use(PPCContext& ctx, uint8_t* base, uint32_t p) {
     float dx = getf(a + 0x1C0) - px, dy = getf(a + 0x1C4) - py, dz = getf(a + 0x1C8) - pz;
     float d2 = dx * dx + dy * dy;
     if (d2 >= 230.0f * 230.0f || std::fabs(dz) > 180.0f) continue;
+    // Lootables (cash registers, desks, corpses...): StaticMeshContainer-style actors keep their loot in
+    // a Container object. Offset cached per class (0 = none).
+    {
+      static std::unordered_map<uint32_t, uint32_t> s_cont_off;
+      uint32_t c = BE32(base, a + 0x2C);
+      auto it = s_cont_off.find(c);
+      if (it == s_cont_off.end()) {
+        uint32_t o = 0, m = 0;
+        it = s_cont_off.emplace(c, FindPropOffset(ctx, base, a, "Container", &o, &m) && !m ? o : 0).first;
+      }
+      // Already emptied: skip it so the next lootable/pickup in reach gets picked (was "already looted" x6).
+      if (it->second && std::find(g_p2_looted.begin(), g_p2_looted.end(), BE32(base, a + it->second)) != g_p2_looted.end()) continue;
+      if (it->second) {
+        static uint32_t s_owner_off = 0; uint32_t om = 0;
+        if (!s_owner_off) FindPropOffset(ctx, base, a, "Owner", &s_owner_off, &om);
+        if (s_owner_off && BE32(base, a + s_owner_off) == p) continue;  // his own weapons
+      }
+      if (it->second && InHeap(BE32(base, a + it->second)) && d2 < bestd) {
+        best = a; bestd = d2; bestcn = ClassNameCached(ctx, base, c, sp); best_container = BE32(base, a + it->second);
+        continue;
+      }
+    }
     bool pick = false; std::string first, chain;
     for (uint32_t c = BE32(base, a + 0x2C), k = 0; c && HeapOrImg(c) && k < 12; c = BE32(base, c + 0x38), ++k) {
-      std::string nm = FNameStr(ctx, base, c, sp);
+      std::string nm = ClassNameCached(ctx, base, c, sp);
       if (k == 0) first = nm;
       if (k > 0 && k < 4) chain += "<" + nm;
       if (nm == "Pickup" || nm.find("PickupItem") != std::string::npos || nm.find("Ammo") != std::string::npos ||
           nm.find("Money") != std::string::npos || nm.find("Cash") != std::string::npos) { pick = true; break; }
     }
-    if (!pick) near.push_back({d2, first + chain});
+    static const char* kNoise[] = {"AIAttachment", "Emitter", "Light", "SoundInstance", "NavigationPoint", "PathNode",
+                                   "Marker", "Trigger", "Brush", "StaticMeshActor", "AmbientSound", "Script<",
+                                   "ZoneInfo", "HavokConstraint", "Spawner", "Keypoint", "CubemapProbe", "Controller<",
+                                   "HavokForceActor", "sink<", "toilet<", "dyn_", "ReactiveAnimatedMesh"};
+    // Switches (padlocks, buttons, levers): "use" fires the switch's Event, like breaking/pressing it.
+    if (!pick && (first + chain).find("Switch") != std::string::npos && d2 < bestd) {
+      uint32_t eo = 0, mm = 0;
+      if (std::find(g_p2_switched.begin(), g_p2_switched.end(), a) == g_p2_switched.end() && FindPropOffset(ctx, base, a, "Event", &eo, &mm)) {
+        std::string ev = FNameAtAddr(ctx, base, a + eo, sp);
+        if (!ev.empty() && ev != "None") { best_switch = a; best_switch_ev = ev; best_switch_cn = first; }
+      }
+    }
+    bool noise = false;
+    for (const char* nz : kNoise) noise = noise || (first + chain).find(nz) != std::string::npos;
+    if (!pick && !noise) {
+      near_list.push_back({d2, first + chain});
+      // "use" only on interactive things (UsedBy went to splicers, decals and props, 2026-11-03).
+      const std::string fc = first + chain;
+      static const char* kInteract[] = {"Switch", "Machine", "Station", "Button", "Lever", "Valve", "Coinslot", "Door", "Vending", "Console", "Panel"};
+      bool inter = false;
+      for (const char* x : kInteract) inter = inter || fc.find(x) != std::string::npos;
+      if (inter) usable.push_back({fc.find("Switch") != std::string::npos ? d2 * 0.25f : d2, a});
+    }
     if (d2 >= bestd) continue;
-    if (pick) { best = a; bestd = d2; bestcn = first; }
+    if (pick) { best = a; bestd = d2; bestcn = first; best_container = 0; }
+  }
+  if (!best && !usable.empty()) {
+    // The game's own interaction, as the Big Daddy: try the usual UnrealScript "use" entry points on the
+    // nearest usable actor. Which one BioShock really uses: watch Jack use a switch (world watch logs it).
+    std::sort(usable.begin(), usable.end());
+    static const char* kUse[] = {"OnUsed", "UsedBy", "Frob", "OnUse"};
+    static std::vector<uint32_t> s_used;
+    for (size_t i = 0; i < usable.size() && i < 3; ++i) {
+      uint32_t a = usable[i].second;
+      if (std::find(s_used.begin(), s_used.end(), a) != s_used.end()) continue;
+      for (const char* fnm : kUse) {
+        if (!CallEvent(ctx, base, a, fnm, {p}, true)) continue;
+        s_used.push_back(a); if (s_used.size() > 256) s_used.erase(s_used.begin());
+        Log(fmt::format("P2 use: {}.{}(Big Daddy)", ClassNameCached(ctx, base, BE32(base, a + 0x2C), sp), fnm));
+        return;
+      }
+    }
+  }
+  if (!best && best_switch) {
+    g_p2_switched.push_back(best_switch);
+    BsQueueCommand("causeevent " + best_switch_ev);
+    Log(fmt::format("P2 use: {} -> event '{}'", best_switch_cn, best_switch_ev));
+    return;
   }
   if (!best) {
-    std::sort(near.begin(), near.end());
+    std::sort(near_list.begin(), near_list.end());
     std::string list;
-    for (size_t i = 0; i < near.size() && i < 6; ++i) list += fmt::format(" | {} ({:.0f})", near[i].second, std::sqrt(near[i].first));
+    for (size_t i = 0; i < near_list.size() && i < 6; ++i) list += fmt::format(" | {} ({:.0f})", near_list[i].second, std::sqrt(near_list[i].first));
     Log("P2 use: nothing to pick up within reach");
     REXLOG_INFO("bioshock-recomp: give: P2 use: in reach but not pickups:{}", list.empty() ? " (nothing)" : list);
+    return;
+  }
+  if (best_container) {
+    // The game's own "Take All": open the container in Jack's inventory manager, select every slot
+    // (takes it), close. Natives under execOpenContainer / execSelectAllContainerSlots / execCloseContainer.
+    DeriveFromPlayer(base);
+    uint32_t inv = g_invmgr.load();
+    if (!inv) { Log("P2 use: Jack's inventory not captured yet - move Jack a bit and retry"); return; }
+    auto& s_looted = g_p2_looted;
+    PPCContext sv = ctx;
+    uint32_t lsp = (ctx.r1.u32 - 0x4000) & ~0xFu;
+    // inv+72 = the open container. OpenContainer sets it; SelectAll takes the 3 slots and, once the
+    // container is empty, the game closes it itself (clears +72). CloseContainer does not null-check
+    // +72, so only close when it is still open (closing twice crashed, 2026-11-03).
+    // OpenContainer first CLOSES whatever +72 holds; a stale pointer there crashed inside CloseContainer
+    // (crash_20261103_011112). Only open when nothing is open, and never Big Daddy gear.
+    if (uint32_t open_now = BE32(base, inv + 72); open_now) {
+      Log(fmt::format("P2 use: Jack already has a container open ({:08X}) - skipped {}", open_now, bestcn));
+      return;
+    }
+    ctx.r1.u64 = lsp; ctx.r3.u64 = inv; ctx.r4.u64 = best_container; __imp__sub_824BCC80(ctx, base); ctx = sv;
+    if (BE32(base, inv + 72) != best_container) { Log(fmt::format("P2 use: {} would not open", bestcn)); return; }
+    ctx.r1.u64 = lsp; ctx.r3.u64 = inv; __imp__sub_824BE9A0(ctx, base); ctx = sv;
+    const bool still_open = BE32(base, inv + 72) != 0;
+    if (still_open && InHeap(BE32(base, inv + 72))) { ctx.r1.u64 = lsp; ctx.r3.u64 = inv; __imp__sub_824BC4D0(ctx, base); ctx = sv; }
+    s_looted.push_back(best_container);
+    if (s_looted.size() > 512) s_looted.erase(s_looted.begin());
+    Log(fmt::format("P2 use: looted {} for Jack (Take All{})", bestcn, still_open ? ", closed it" : ", game closed it"));
     return;
   }
   // Item class: a property naming it, else the actor's own class. Count: first sane int property.
@@ -1153,8 +1457,27 @@ static void BsP2Use(PPCContext& ctx, uint8_t* base, uint32_t p) {
   std::string stem = bestcn;
   if (stem.size() > 6 && stem.compare(stem.size() - 6, 6, "Pickup") == 0) stem.resize(stem.size() - 6);
   auto has = [&](const char* k) { return bestcn.find(k) != std::string::npos; };
+  // The game's own pickup first, for every item (world watch 2026-11-03, Jack picking things up):
+  //   X.GetRequiredPlacementForUse -> X.OnUsed -> X.GetLoot -> Jack.AddStackToInventory / Jack.AddLogEntry.
+  // OnUsed with Jack as the user handles counts, full inventory, HUD messages and diaries (which then play).
+  // "Taken" = Jack got an OnPickedUpInventoryItem / AddLogEntry event during the call, or the item hid itself.
+  {
+    const uint32_t jc = InHeap(pl) ? BE32(base, pl + 0x420) : 0;
+    struct Try { const char* fn; uint32_t who; const char* tag; };
+    const Try tries[] = {{"OnUsed", pl, "Jack"}, {"OnUsed", jc, "Jack's controller"}};
+    for (const Try& t : tries) {
+      g_jack_got = false;
+      if (!t.who || !CallEvent(ctx, base, best, t.fn, {t.who})) continue;
+      uint32_t ho = 0, hm = 0; bool hidden = false;
+      if (InHeap(best) && FindPropOffset(ctx, base, best, "bHidden", &ho, &hm) && hm) hidden = (BE32(base, best + ho) & hm) != 0;
+      const bool got = g_jack_got.load() || hidden;
+      Log(fmt::format("P2 use: {}.{}({}) -> {}", bestcn, t.fn, t.tag, got ? "taken for Jack (game's own pickup)" : "called, still there"));
+      if (got) { s_taken.push_back(best); if (s_taken.size() > 256) s_taken.erase(s_taken.begin()); return; }
+    }
+  }
   if (has("Adam") || has("Log") || has("Diary") || has("Key") || has("Quest")) {
     Log(fmt::format("P2 use: {} is a story item - Jack has to pick that one up", bestcn));
+    s_taken.push_back(best);  // left for Jack; skip it on the next press
     return;
   }
   bool given = false;
@@ -1188,7 +1511,11 @@ static void BsP2Use(PPCContext& ctx, uint8_t* base, uint32_t p) {
     static std::vector<uint32_t> s_dumped;  // one property dump per pickup class (recon)
     uint32_t pc = BE32(base, best + 0x2C);
     if (std::find(s_dumped.begin(), s_dumped.end(), pc) == s_dumped.end()) { s_dumped.push_back(pc); DumpProps(ctx, base, best, bestcn.c_str()); }
-    Log(fmt::format("P2 use: {} ({:08X}) - Jack's inventory refused it (full, or not an inventory item; class via {})", bestcn, best, how));
+    Log(fmt::format("P2 use: {} ({:08X}) - Jack's inventory refused it (full, or not an inventory item; class via {}) - skipping it from now on", bestcn, best, how));
+    // Remember it (left in the world for Jack), so the next press moves on to other items and switches
+    // instead of retrying it forever (PhysicalPlasmidPickup x13, 2026-11-03).
+    s_taken.push_back(best);
+    if (s_taken.size() > 256) s_taken.erase(s_taken.begin());
     return;
   }
   // Taken: hide it, drop its collision, sink it under the floor so Jack cannot take it again.
@@ -1201,12 +1528,223 @@ static void BsP2Use(PPCContext& ctx, uint8_t* base, uint32_t p) {
   Log(fmt::format("P2 use: picked up {} x{} for Jack (class via {}, count via {})", bestcn, got, how, cnt_how));
 }
 
+// Hit assist: the Big Daddy's real weapons only connect when the animated arm sweeps through the target
+// (the AI also gets root motion and attack-state timing we do not have), so real hits miss a lot. After
+// the real weapon fires, if the nearest enemy in front within reach did not lose health, apply the hit
+// directly (TakeSimpleDamage core, type 17, instigator Jack so no friendly-fire filter). Optional knockback.
+static uint32_t AssistHit(PPCContext& ctx, uint8_t* base, uint32_t p, float cx, float cy, float reach, float cone,
+                          double dmg, float knock, uint32_t only_if_unhurt, float hp_before) {
+  uint32_t pl = g_player.load(), d = 0, n = 0, best = 0;
+  if (!pl || !FindActorList(base, pl, &d, &n)) return 0;
+  auto getf = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
+  auto putf = [&](uint32_t a, float f) { uint32_t v; std::memcpy(&v, &f, 4); base[a] = uint8_t(v >> 24); base[a + 1] = uint8_t(v >> 16); base[a + 2] = uint8_t(v >> 8); base[a + 3] = uint8_t(v); };
+  if (only_if_unhurt && InHeap(only_if_unhurt) && getf(only_if_unhurt + 1356) < hp_before) return 0;  // real hit landed
+  uint32_t sp = (ctx.r1.u32 - 0x5800) & ~0xFu;
+  float px = getf(p + 0x1C0), py = getf(p + 0x1C4), pz = getf(p + 0x1C8), bestd = reach * reach;
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t o = BE32(base, d + 4 * i);
+    if (!InHeap(o) || o == p || o == pl || !(getf(o + 1356) > 0.0f)) continue;
+    float ox = getf(o + 0x1C0) - px, oy = getf(o + 0x1C4) - py, oz = getf(o + 0x1C8) - pz;
+    float dd = ox * ox + oy * oy;
+    if (dd >= bestd || std::fabs(oz) > 160.0f || dd < 1.0f) continue;
+    if ((ox * cx + oy * cy) / std::sqrt(dd) < cone) continue;
+    if (!ShouldDouble(ctx, base, BE32(base, o + 0x2C), sp)) continue;  // AI pawns only
+    best = o; bestd = dd;
+  }
+  if (!best) return 0;
+  PPCContext saved = ctx;
+  std::memset(base + sp + 0x1400, 0, 8);  // FName None
+  ctx.r1.u64 = sp; ctx.r3.u64 = best; ctx.r4.u64 = 17; ctx.f1.f64 = dmg; ctx.f2.f64 = 1.0;
+  ctx.r5.u64 = 0; ctx.r6.u64 = 0; ctx.r7.u64 = pl; ctx.r8.u64 = sp + 0x1400;
+  __imp__sub_8250EFB0(ctx, base);
+  ctx = saved;
+  if (knock > 0.0f) {
+    float ox = getf(best + 0x1C0) - px, oy = getf(best + 0x1C4) - py, dd = std::sqrt(ox * ox + oy * oy);
+    if (dd > 1.0f) { putf(best + 0x1D8, ox / dd * knock); putf(best + 0x1D8 + 4, oy / dd * knock); putf(best + 0x1D8 + 8, knock * 0.35f); }
+  }
+  return best;
+}
+
+// Level triggers (ghost scenes, scripted moments) fire when Jack walks in. While you drive the Big Daddy,
+// any trigger he stands in fires its Event tag through the CheatManager's "causeevent" (same as a touch
+// by the player). Each trigger fires once per session from him.
+std::atomic<bool> g_p2_triggers{true};
+void BsP2Triggers(bool on) { g_p2_triggers = on; }
+static std::string FNameAtAddr(PPCContext& ctx, uint8_t* base, uint32_t addr, uint32_t sp) {
+  return FNameStr(ctx, base, addr - 0x24, sp);  // FNameStr reads the FName at obj+0x24
+}
+static void BsP2TouchTriggers(PPCContext& ctx, uint8_t* base, uint32_t p) {
+  if (!g_p2_triggers.load()) return;
+  static auto s_t = std::chrono::steady_clock::now();
+  if (std::chrono::steady_clock::now() - s_t < std::chrono::milliseconds(250)) return;
+  s_t = std::chrono::steady_clock::now();
+  uint32_t pl = g_player.load(), d = 0, n = 0;
+  if (!InHeap(pl) || !FindActorList(base, pl, &d, &n)) return;
+  auto rf = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
+  uint32_t sp = (ctx.r1.u32 - 0x5000) & ~0xFu;
+  static std::unordered_map<uint32_t, int> s_trig_cls;  // class -> 1 trigger, 0 not
+  static std::vector<uint32_t> s_fired;
+  static uint32_t s_ro = 0, s_ho = 0, s_eo = 0;          // CollisionRadius / CollisionHeight / Event offsets
+  float px = rf(p + 0x1C0), py = rf(p + 0x1C4), pz = rf(p + 0x1C8);
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t a = BE32(base, d + 4 * i);
+    if (!InHeap(a) || a == p || a == pl) continue;
+    float dx = rf(a + 0x1C0) - px, dy = rf(a + 0x1C4) - py, dz = rf(a + 0x1C8) - pz;
+    if (dx * dx + dy * dy > 1500.0f * 1500.0f) continue;
+    uint32_t c = BE32(base, a + 0x2C);
+    auto it = s_trig_cls.find(c);
+    if (it == s_trig_cls.end()) {
+      int trig = 0;
+      for (uint32_t c2 = c, k = 0; c2 && HeapOrImg(c2) && k < 8; c2 = BE32(base, c2 + 0x38), ++k)
+        if (ClassNameCached(ctx, base, c2, sp).find("Trigger") != std::string::npos) { trig = 1; break; }
+      it = s_trig_cls.emplace(c, trig).first;
+    }
+    if (!it->second || std::find(s_fired.begin(), s_fired.end(), a) != s_fired.end()) continue;
+    uint32_t m = 0;
+    if (!s_ro) { FindPropOffset(ctx, base, a, "CollisionRadius", &s_ro, &m); FindPropOffset(ctx, base, a, "CollisionHeight", &s_ho, &m); FindPropOffset(ctx, base, a, "Event", &s_eo, &m); }
+    if (!s_ro || !s_ho || !s_eo) {
+      static bool s_warned = false;
+      if (!s_warned) { s_warned = true; Log(fmt::format("P2 triggers: property offsets missing (radius {} height {} event {}) - triggers off", s_ro, s_ho, s_eo)); }
+      return;
+    }
+    {
+      // Diagnostics (no trigger has ever fired): nearest trigger every 5 s while one is within 1500.
+      static auto s_dlog = std::chrono::steady_clock::now();
+      if (std::chrono::steady_clock::now() - s_dlog > std::chrono::seconds(5)) {
+        s_dlog = std::chrono::steady_clock::now();
+        Log(fmt::format("P2 triggers: near {} dist {:.0f} dz {:.0f} radius {:.0f} height {:.0f} event '{}'",
+                        ClassNameCached(ctx, base, c, sp), std::sqrt(dx * dx + dy * dy), dz, rf(a + s_ro), rf(a + s_ho),
+                        FNameAtAddr(ctx, base, a + s_eo, sp)));
+      }
+    }
+    float r = rf(a + s_ro) + 40.0f, h = rf(a + s_ho) + 90.0f;  // + his size (squeezed radius, half-height)
+    if (dx * dx + dy * dy > r * r || std::fabs(dz) > h) continue;
+    std::string ev = FNameAtAddr(ctx, base, a + s_eo, sp);
+    s_fired.push_back(a);
+    if (ev.empty() || ev == "None") continue;
+    BsQueueCommand("causeevent " + ev);
+    Log(fmt::format("P2: walked into {} -> event '{}'", ClassNameCached(ctx, base, c, sp), ev));
+  }
+}
+
 void BsTraceFlush();
+// World watch (2026-11-03): find the proximity code that opens doors / fires ghost TriggerVolumes for Jack.
+// Every 0.5 s the doors, movers and triggers within 800 of Jack go into a small watch list; the
+// CallFunction hook logs every script function called on them (and door/touch/trigger-ish calls on
+// Jack himself), each new name once with a guest call stack. The stack's native frames are the
+// proximity/touch dispatcher (and likely ProcessEvent) to hook so the Big Daddy gets the same treatment.
+std::atomic<bool> g_world_watch{true};
+std::atomic<bool> g_in_p2_move{false};  // true only inside the Big Daddy's own MoveActor call
+void BsWorldWatch(bool on) { g_world_watch = on; }
+std::atomic<uint32_t> g_watch[32];
+std::atomic<uint32_t> g_watch_n{0};
+static std::mutex g_watch_mu;
+std::atomic<uint32_t> g_fn_canseeus{0};  // InPlayerViewTrigger.PlayerCanSeeUs, learned in the watch scan
+static std::unordered_map<uint32_t, std::string> g_watch_cls;  // actor -> class name (guarded)
+static void BsWorldWatchScan(PPCContext& ctx, uint8_t* base) {
+  if (!g_world_watch.load()) { g_watch_n = 0; return; }
+  static auto s_t = std::chrono::steady_clock::now();
+  if (std::chrono::steady_clock::now() - s_t < std::chrono::milliseconds(500)) return;
+  s_t = std::chrono::steady_clock::now();
+  uint32_t pl = g_player.load(), d = 0, n = 0;
+  if (!InHeap(pl) || !FindActorList(base, pl, &d, &n)) return;
+  auto rf = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
+  uint32_t sp = (ctx.r1.u32 - 0x5000) & ~0xFu;
+  static std::unordered_map<uint32_t, int> s_kind;  // class -> 1 watch, 0 not
+  float px = rf(pl + 0x1C0), py = rf(pl + 0x1C4), pz = rf(pl + 0x1C8);
+  uint32_t k = 0;
+  std::unordered_map<uint32_t, std::string> cls;
+  for (uint32_t i = 0; i < n && k < 32; ++i) {
+    uint32_t a = BE32(base, d + 4 * i);
+    if (!InHeap(a) || a == pl || a == g_p2.load()) continue;
+    float dx = rf(a + 0x1C0) - px, dy = rf(a + 0x1C4) - py, dz = rf(a + 0x1C8) - pz;
+    bool close = dx * dx + dy * dy + dz * dz <= 800.0f * 800.0f;
+    if (uint32_t b2 = g_p2.load(); !close && b2 && InHeap(b2)) {
+      float ex = rf(a + 0x1C0) - rf(b2 + 0x1C0), ey = rf(a + 0x1C4) - rf(b2 + 0x1C4), ez = rf(a + 0x1C8) - rf(b2 + 0x1C8);
+      close = ex * ex + ey * ey + ez * ez <= 800.0f * 800.0f;  // and around the Big Daddy
+    }
+    if (!close) continue;
+    uint32_t c = BE32(base, a + 0x2C);
+    auto it = s_kind.find(c);
+    if (it == s_kind.end()) {
+      int w = 0;
+      for (uint32_t c2 = c, j = 0; c2 && HeapOrImg(c2) && j < 8; c2 = BE32(base, c2 + 0x38), ++j) {
+        std::string nm = ClassNameCached(ctx, base, c2, sp);
+        if (nm == "Mover" || nm.find("Trigger") != std::string::npos || nm.find("Door") != std::string::npos ||
+            nm == "Volume" || nm == "Switch" || nm.find("Pickup") != std::string::npos) { w = 1; break; }
+      }
+      it = s_kind.emplace(c, w).first;
+    }
+    if (!it->second) continue;
+    if (!g_fn_canseeus.load() && ClassNameCached(ctx, base, c, sp) == "InPlayerViewTrigger")
+      if (uint32_t f = FindFunction(ctx, base, a, "PlayerCanSeeUs")) { g_fn_canseeus = f; Log("P2: learned PlayerCanSeeUs"); }
+    g_watch[k++] = a;
+    cls[a] = ClassNameCached(ctx, base, c, sp);
+  }
+  { std::lock_guard<std::mutex> lk(g_watch_mu); g_watch_cls.swap(cls); }
+  g_watch_n = k;
+  static uint32_t s_last = 0xFFFFFFFF;
+  if (k != s_last) { s_last = k; Log(fmt::format("world watch: {} doors/triggers within 800 of Jack", k)); }
+}
+// Slow-frame profiler: BsTickP2 runs once per game frame, so the gap between calls is the frame time.
+// Frames over 250 ms log our own last tick cost plus where both players are (stall triage, 2026-11-03).
+static double g_our_tick_ms = 0.0;
+struct OurTickTimer {
+  std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  ~OurTickTimer() { g_our_tick_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+};
 void BsTickP2(PPCContext& ctx, uint8_t* base) {
+  {
+    static auto s_prev = std::chrono::steady_clock::now();
+    auto now0 = std::chrono::steady_clock::now();
+    double gap = std::chrono::duration<double, std::milli>(now0 - s_prev).count();
+    s_prev = now0;
+    if (gap > 250.0) {
+      auto rf = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
+      uint32_t p2 = g_p2.load(), pl = g_player.load(), d = 0, n = 0;
+      std::string where;
+      if (InHeap(pl)) where += fmt::format(" Jack {:.0f},{:.0f},{:.0f}", rf(pl + 0x1C0), rf(pl + 0x1C4), rf(pl + 0x1C8));
+      if (p2 && InHeap(p2) && InHeap(pl)) {
+        float dx = rf(p2 + 0x1C0) - rf(pl + 0x1C0), dy = rf(p2 + 0x1C4) - rf(pl + 0x1C4), dz = rf(p2 + 0x1C8) - rf(pl + 0x1C8);
+        where += fmt::format(" | BD {:.0f},{:.0f},{:.0f} dist {:.0f}", rf(p2 + 0x1C0), rf(p2 + 0x1C4), rf(p2 + 0x1C8), std::sqrt(dx * dx + dy * dy + dz * dz));
+      }
+      if (InHeap(pl)) FindActorList(base, pl, &d, &n);
+      REXLOG_INFO("bioshock-recomp: SLOW FRAME {:.0f} ms (our code last frame {:.1f} ms) |{} | actors {} | split {} driving {}",
+                  gap, g_our_tick_ms, where, n, BsCoopSplit(), BsP2KeyboardActive());
+    }
+  }
+  OurTickTimer our_timer;
   BsTraceFlush();
+  BsWorldWatchScan(ctx, base);
+  if (uint32_t hp2 = g_p2.load(); hp2 && InHeap(hp2)) {
+    auto rf = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
+    float hp = rf(hp2 + 1356), mx = rf(hp2 + 1876);
+    static float s_prev_hp = -1.0f;
+    if (s_prev_hp > 0.0f && hp < s_prev_hp - 1.0f) g_cam_shake = std::max(g_cam_shake, 6.0f);  // he got hit
+    s_prev_hp = hp;
+    g_hud_hp = hp; g_hud_max = (mx > 0.0f && mx < 100000.0f) ? mx : std::max(hp, 1.0f);
+  }
   uint32_t p = g_p2.load();
+  // Auto-return: a death reload (or Vita-Chamber level reset) wipes spawned actors, him included. Once
+  // Jack is back and alive for 4 s, summon a new Big Daddy next to him and hand the controls back.
+  {
+    static auto s_gone_at = std::chrono::steady_clock::time_point{};
+    static bool s_waiting = false;
+    if (p && !(!InHeap(p) || BE32(base, p + 0x2C) != g_p2_class.load())) s_waiting = false;
+    else if (g_p2_keep.load()) {
+      auto now = std::chrono::steady_clock::now();
+      if (!s_waiting) { s_waiting = true; s_gone_at = now; }
+      uint32_t pl = g_player.load();
+      float jhp = 0.0f;
+      if (InHeap(pl)) { uint32_t v = BE32(base, pl + 1356); std::memcpy(&jhp, &v, 4); }
+      if (now - s_gone_at > std::chrono::seconds(4) && jhp > 0.0f && !g_p2_want.load()) {
+        s_gone_at = now + std::chrono::seconds(6);  // retry spacing if the spawn fails
+        BsP2QuickSpawn("Jack is back");
+      }
+    }
+  }
   if (!p) return;
-  if (!InHeap(p) || BE32(base, p + 0x2C) != g_p2_class.load()) { g_p2 = 0; g_p2_kbd = false; Log("P2: pawn gone"); return; }
+  if (!InHeap(p) || BE32(base, p + 0x2C) != g_p2_class.load()) { g_p2 = 0; g_p2_kbd = false; Log("P2: pawn gone (auto-return after Jack respawns)"); return; }
   uint16_t b = 0; int16_t lx = 0, ly = 0, rx = 0, ry = 0; uint8_t rt = 0;
   bool attack = false, drill = false, jump = false, slam_btn = false, use = false, shove = false, roar = false, charge_btn = false;
   // Controller Back/View button = swap between Jack and the Big Daddy (like F8).
@@ -1239,7 +1777,7 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
       g_pad_pitch = pry;
       // Pad: RT punch, LT/LB/RB drill, B slam, A jump, L3 run.
       attack = attack || prt > 100;
-      drill = drill || (pb & 0x0300) || BsPadLT(0) > 100;
+      drill = drill || (pb & 0x0300) || BsPadLT(0) > 60;
       jump = jump || (pb & 0x1000);
       slam_btn = slam_btn || (pb & 0x2000);
       use = use || (pb & 0x4000);  // X
@@ -1250,7 +1788,7 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
     }
   } else if (BsPadPollIndex(1, &b, &lx, &ly, &rx, &ry, &rt)) {
     attack = rt > 100;
-    drill = (b & 0x0300) != 0 || BsPadLT(1) > 100;
+    drill = (b & 0x0300) != 0 || BsPadLT(1) > 60;
     use = (b & 0x4000) != 0;  // X
     shove = (b & 0x8000) != 0;  // Y
     roar = (b & 0x0001) != 0;   // D-pad up
@@ -1319,6 +1857,7 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
     if (use && !s_use_prev) BsP2Use(ctx, base, p);
     s_use_prev = use;
   }
+  BsP2TouchTriggers(ctx, base, p);
   static uint32_t s_p2_ctrl = 0, s_p2_ctrl_of = 0;
   if (s_p2_ctrl_of != p) { s_p2_ctrl_of = p; s_p2_ctrl = BE32(base, p + 0x420); }
   if (g_p2_detach.load()) put(p + 0x420, 0);  // no AI controller fighting the input
@@ -1361,19 +1900,73 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
       ctx.r7.u64 = (uint64_t(BE32(base, p + 0x1CC)) << 32) | uint32_t(yaw);
       ctx.r8.u64 = uint64_t(BE32(base, p + 0x1CC + 8)) << 32;
       ctx.r9.u64 = sp + 144; ctx.r10.u64 = 0;
+      g_in_p2_move = true;   // touches dispatched inside this MoveActor are the Big Daddy's (see P2MoveOverride)
       mv(ctx, base);
+      g_in_p2_move = false;
       ctx = saved;
     };
     float bx = getf(p + 0x1C0), by = getf(p + 0x1C4);
     auto progress = [&] { float mx = getf(p + 0x1C0) - bx, my = getf(p + 0x1C4) - by; return std::sqrt(mx * mx + my * my); };
     float want = std::sqrt(dx * dx + dy * dy);
     move(dx, dy, 0.0f);
+    const uint32_t hit_actor = BE32(base, sp + 148);  // FCheckResult.Actor (Next +0, Actor +4, ... Time +36)
     bool stepped = false;
     if (progress() < want * 0.6f) {
       float px = getf(p + 0x1C0), py = getf(p + 0x1C4), pz = getf(p + 0x1C8);
       move(0.0f, 0.0f, 24.0f);
       move(dx - (px - bx), dy - (py - by), 0.0f);
-      if (progress() < want * 0.6f) { putf(p + 0x1C0, px); putf(p + 0x1C4, py); putf(p + 0x1C8, pz); }
+      if (progress() < want * 0.6f) {
+        putf(p + 0x1C0, px); putf(p + 0x1C4, py); putf(p + 0x1C8, pz);
+        // Blocked by something real or by a designer blocker? BioShock keeps Big Daddies out of small
+        // rooms (restrooms...) with BlockingVolumes; those are walked through, real geometry is not.
+        if (InHeap(hit_actor) && g_p2_squeeze.load()) {
+          std::string chain;
+          uint32_t csp = (ctx.r1.u32 - 0x5000) & ~0xFu;
+          for (uint32_t c = BE32(base, hit_actor + 0x2C), k = 0; c && HeapOrImg(c) && k < 6; c = BE32(base, c + 0x38), ++k)
+            chain += ClassNameCached(ctx, base, c, csp) + "<";
+          static std::vector<std::string> s_seen_block;
+          if (std::find(s_seen_block.begin(), s_seen_block.end(), chain) == s_seen_block.end() && s_seen_block.size() < 32) {
+            s_seen_block.push_back(chain);
+            Log(fmt::format("P2 move: blocked by {}", chain));
+          }
+          const bool loose_prop = chain.rfind("PhysicalReactiveActor<", 0) == 0 || chain.find("<PhysicalReactiveActor<") != std::string::npos ||
+                                  chain.find("PhysicalStaticMeshContainer<") != std::string::npos;
+          if (chain.find("BlockingVolume") != std::string::npos || chain.find("Volume<") != std::string::npos || loose_prop) {
+            putf(p + 0x1C0, bx + dx); putf(p + 0x1C4, by + dy);  // designer blocker or a loose prop (bucket, mop, trash can): through
+          } else if ((chain.find("Mover<") != std::string::npos || chain.rfind("DoorModel<", 0) == 0) && g_p2_triggers.load()) {
+            // Doors are Movers: fire their Tag like the door's own trigger would (3 s cooldown per door).
+            static std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> s_door_t;
+            auto now = std::chrono::steady_clock::now();
+            auto dt = s_door_t.find(hit_actor);
+            if (dt == s_door_t.end() || now - dt->second > std::chrono::seconds(3)) {
+              s_door_t[hit_actor] = now;
+              // The door's own open functions (seen on Jack's doors: WelcomeDoors.OpenIfPossible / Unlock /
+              // Open / OpenAndHold, ScriptableMover.DoOpen). Try them as the Big Daddy first.
+              for (const char* fnm : {"OpenIfPossible", "DoOpen", "Open"}) {
+                if (CallEvent(ctx, base, hit_actor, fnm, {}, true)) {
+                  static int s_dl = 0;
+                  if (++s_dl <= 6) Log(fmt::format("P2 move: door {}.{}() called", chain.substr(0, chain.find('<')), fnm));
+                  break;
+                }
+              }
+              uint32_t to = 0, tm = 0;
+              std::string tag = FindPropOffset(ctx, base, hit_actor, "Tag", &to, &tm) ? FNameAtAddr(ctx, base, hit_actor + to, csp) : "";
+              const std::string cls0 = chain.substr(0, chain.find('<'));
+              if (!tag.empty() && tag != "None" && tag != cls0) {
+                BsQueueCommand("causeevent " + tag);
+                Log(fmt::format("P2 move: door {} -> event '{}'", cls0, tag));
+              } else {
+                Log(fmt::format("P2 move: door {} has no own Tag (opens by Jack's proximity) - walking through", cls0));
+              }
+            }
+            // Doors now open for him (P2MoveOverride answers CanOpenDoors / trigger criteria while he moves).
+            // Fallback: still shut after 1.5 s of pushing (locked, no power, scripted) -> walk through.
+            static uint32_t s_door = 0; static auto s_door_since = std::chrono::steady_clock::now();
+            if (s_door != hit_actor || now - s_door_since > std::chrono::seconds(4)) { s_door = hit_actor; s_door_since = now; }
+            else if (now - s_door_since > std::chrono::milliseconds(1500)) { putf(p + 0x1C0, bx + dx); putf(p + 0x1C4, by + dy); }
+          }
+        }
+      }
       else stepped = true;
     }
     move(0.0f, 0.0f, stepped ? -30.0f : -6.0f);
@@ -1422,7 +2015,8 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
     } else {
       want = "Fidget1";
     }
-    if (want != s_cur) { s_cur = want; PlaySlot(ctx, base, p, want.c_str(), 0, 8); }
+    if (std::chrono::steady_clock::now() < g_charge_until) s_cur = "(charge)";  // charge owns the legs
+    else if (want != s_cur) { s_cur = want; PlaySlot(ctx, base, p, want.c_str(), 0, 8); }
   }
   {
     // Ally = the game's own hypnotized-Big-Daddy state (props + enum probe, 2026-11-01):
@@ -1459,7 +2053,7 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
           if (ox * ox + oy * oy > 2000.0f * 2000.0f) continue;
           uint32_t cls = BE32(base, o + 0x2C);
           if (!ShouldDouble(ctx, base, cls, sp2)) continue;  // AI pawns only
-          std::string cn = FNameStr(ctx, base, cls, sp2);
+          std::string cn = ClassNameCached(ctx, base, cls, sp2);
           if (cn.find("Bouncer") != std::string::npos || cn.find("Rosie") != std::string::npos) continue;
           // Only EcologyFighter subclasses (splicers) have the forced-enemy list.
           static std::unordered_map<uint32_t, bool> s_eco;
@@ -1467,7 +2061,7 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
           if (it == s_eco.end()) {
             bool eco = false;
             for (uint32_t c2 = cls, k = 0; c2 && HeapOrImg(c2) && k < 16; c2 = BE32(base, c2 + 0x38), ++k)
-              if (FNameStr(ctx, base, c2, sp2) == "EcologyFighter") { eco = true; break; }
+              if (ClassNameCached(ctx, base, c2, sp2) == "EcologyFighter") { eco = true; break; }
             it = s_eco.emplace(cls, eco).first;
             Log(fmt::format("P2: {} is {}an EcologyFighter", cn, eco ? "" : "not "));
           }
@@ -1595,7 +2189,7 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
   {
     static uint32_t s_hold_of = 0; static float s_hx = 0, s_hy = 0;
     if (g_p2_kbd.load() || driving) {
-      if (s_hold_of != p || fwd != 0.0f || side != 0.0f) { s_hold_of = p; s_hx = getf(p + 0x1C0); s_hy = getf(p + 0x1C4); }
+      if (s_hold_of != p || fwd != 0.0f || side != 0.0f || std::chrono::steady_clock::now() < g_charge_until) { s_hold_of = p; s_hx = getf(p + 0x1C0); s_hy = getf(p + 0x1C4); }
       else { putf(p + 0x1C0, s_hx); putf(p + 0x1C4, s_hy); }  // idle: stay exactly where you left him
     }
     // Blind his AI: no Enemy / Focus / MoveTarget means nothing to chase, face or attack.
@@ -1668,8 +2262,15 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
       float now_hp = getf(o + 1356);
       if (now_hp != hp) res += fmt::format(" {:08X} {:.0f}->{:.0f}", o, hp, now_hp);
     }
-    Log(fmt::format("P2: weapon '{}' {} | {} nearby, damaged:{}", s_pending_attack, ok ? "fired" : "missing",
-                    near_hp.size(), res.empty() ? " none" : res));
+    std::string assist;
+    if (res.empty()) {
+      const bool is_slam = s_pending_slot == 0x1288;
+      if (uint32_t o = AssistHit(ctx, base, p, cx, cy, is_slam ? 195.0f : 170.0f, is_slam ? 0.2f : 0.5f, is_slam ? 90.0 : 60.0,
+                                 is_slam ? 500.0f : 0.0f, 0, 0.0f))
+        assist = fmt::format(" | assist hit {:08X}", o);
+    }
+    Log(fmt::format("P2: weapon '{}' {} | {} nearby, damaged:{}{}", s_pending_attack, ok ? "fired" : "missing",
+                    near_hp.size(), res.empty() ? " none" : res, assist));
     s_pending_attack = nullptr;
   }
   // Charge: B while running (L3 / Shift held), or C. 0.8 s rush at ~3x walk speed, hand-weapon hit
@@ -1679,9 +2280,11 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
   static bool s_charge_prev = false;
   bool charge_req = charge_btn || (slam && running);
   if (charge_req && !s_charge_prev && now > s_charge_end && now - s_last > std::chrono::milliseconds(900)) {
-    s_charge_end = now + std::chrono::milliseconds(800);
+    s_charge_end = now + std::chrono::milliseconds(1000);
+    g_charge_until = s_charge_end;
     s_last = now;
-    PlaySlot(ctx, base, p, "BO_walkFWD_agg", 0, 8);
+    PlaySlot(ctx, base, p, "BO_walkFWD_agg", 0, 8);              // legs
+    PlaySlot(ctx, base, p, "BO_AttackShoulderSlamLONG", 2, 1);   // body: shoulder-first ram
     Log("P2: charge");
   }
   s_charge_prev = charge_req;
@@ -1702,6 +2305,11 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
     if (now - s_charge_hit > std::chrono::milliseconds(200)) {
       s_charge_hit = now;
       FireBDWeapon(ctx, base, p, 0x1284, "BigLeftHook");
+      if (uint32_t o = AssistHit(ctx, base, p, cx, cy, 155.0f, 0.5f, 40.0, 700.0f, 0, 0.0f)) {
+        static int s_ca = 0;
+        if (s_ca++ < 5) Log(fmt::format("P2: charge hit {:08X}", o));
+        g_cam_shake = std::max(g_cam_shake, 7.0f);
+      }
     }
     slam = false;  // B was used for the charge
   }
@@ -1742,6 +2350,7 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
   if (slam && !s_slam_prev && now - s_last > std::chrono::milliseconds(900)) {
     PlaySlot(ctx, base, p, "BO_AttackShoulderSlamLONG", 2, 1);
     slam_hit = true;
+    g_cam_shake = std::max(g_cam_shake, 9.0f);
     Log("P2: slam");
   }
   s_slam_prev = slam;
@@ -1777,6 +2386,10 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
     }
     FireBDWeapon(ctx, base, p, 0x1284, "BigRightHook");  // drill hand
     if (tgt && getf(tgt + 1356) != before) Log(fmt::format("P2: drill {:08X} {:.0f}->{:.0f}", tgt, before, getf(tgt + 1356)));
+    else if (uint32_t o = AssistHit(ctx, base, p, cx, cy, 160.0f, 0.55f, 20.0, 120.0f, tgt, before)) {
+      static int s_da = 0;
+      if (s_da++ < 5) Log(fmt::format("P2: drill assist hit {:08X}", o));
+    }
   }
   if (g_p2_real_weapons.load()) drill_tick = false;  // real drill replaces the simple damage
   if ((attack && now - s_last > std::chrono::milliseconds(900)) || drill_tick || slam_hit) {
@@ -1861,18 +2474,38 @@ extern "C" REX_FUNC(sub_822F8B80) {
     ctx = after;
     return;
   }
-  if (g_p2_want.load() && !g_in_double && ctx.r4.u32) {
+  // P2 capture: only a spawn of the requested class counts. Grabbing "the next spawn" captured a tiny
+  // effect/projectile once (2026-11-03); the Big Daddy code then wrote past its end and corrupted memory.
+  // A request expires after 5 s instead of waiting for any later spawn.
+  static auto s_want_t = std::chrono::steady_clock::now();
+  static bool s_want_prev = false;
+  if (g_p2_want.load() && !s_want_prev) s_want_t = std::chrono::steady_clock::now();
+  s_want_prev = g_p2_want.load();
+  if (g_p2_want.load() && std::chrono::steady_clock::now() - s_want_t > std::chrono::seconds(5)) {
+    g_p2_want = false; s_want_prev = false;
+    Log("P2: spawn request expired (nothing of that class spawned)");
+  }
+  bool p2_class_match = false;
+  if (g_p2_want.load() && !g_in_double && ctx.r4.u32 && HeapOrImg(ctx.r4.u32)) {
+    PPCContext k = ctx;
+    std::string cn = ClassNameCached(ctx, base, ctx.r4.u32, (ctx.r1.u32 - 0x5000) & ~0xFu);
+    ctx = k;
+    std::string want = g_p2_view.empty() ? std::string("Bouncer") : g_p2_view;
+    p2_class_match = cn == want || (want.size() > 3 && cn.find(want) != std::string::npos);
+  }
+  if (p2_class_match) {
     // Disarm before spawning: a Big Daddy spawns its own parts through this same function, and those
     // inner spawns were briefly captured as P2 (and could be doubled). g_in_double blocks both.
-    g_p2_want = false;
+    g_p2_want = false; s_want_prev = false;
     g_in_double = true;
     __imp__sub_822F8B80(ctx, base);
     g_in_double = false;
     if (uint32_t sp_ = ctx.r3.u32) {
       g_p2_class = BE32(base, sp_ + 0x2C); g_p2 = sp_;
       Log(fmt::format("P2: controlling pawn {:08X} (second controller)", sp_));
+      g_hud_flip = false; rex::graphics::split_view::state().invert = false;  // window 2 + HUD = Big Daddy
     } else {
-      g_p2_want = true;  // spawn failed (no room): try the next one
+      Log("P2: the Big Daddy spawn failed (no room?) - try again somewhere more open");
     }
     return;
   }
@@ -2065,6 +2698,32 @@ extern "C" REX_FUNC(sub_823509D0) {
 // 2026-11-02). While you drive P2, only your own attacks (g_our_fire) may swing his weapons.
 extern "C" void __imp__sub_824F9EF8(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" REX_FUNC(sub_824F9EF8) {
+  // Calibration: when any OTHER weapon's hit hurts Jack, log how far its owner stood (angry Big Daddy
+  // melee reach on the player, used to size P2's hit assist). First 12 hits only.
+  {
+    static int s_meas = 0;
+    uint32_t pl = g_player.load(), w = ctx.r3.u32, p2 = g_p2.load();
+    bool ours = p2 && InHeap(p2) && (w == BE32(base, p2 + 0x1284) || w == BE32(base, p2 + 0x1288) || w == BE32(base, p2 + 0x128C));
+    if (s_meas < 12 && !ours && InHeap(pl) && InHeap(w)) {
+      auto rf = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
+      float hp0 = rf(pl + 1356);
+      PPCContext k = ctx;
+      __imp__sub_824F9EF8(ctx, base);
+      PPCContext after = ctx;
+      if (rf(pl + 1356) < hp0) {
+        uint32_t off = 0, m = 0, owner = 0;
+        if (FindPropOffset(ctx, base, w, "Owner", &off, &m)) owner = BE32(base, w + off);
+        if (InHeap(owner)) {
+          float dx = rf(owner + 0x1C0) - rf(pl + 0x1C0), dy = rf(owner + 0x1C4) - rf(pl + 0x1C4);
+          ++s_meas;
+          REXLOG_INFO("bioshock-recomp: give: reach: {} hit Jack from {:.0f} units ({:.0f} -> {:.0f} hp)",
+                      FNameStr(ctx, base, BE32(base, owner + 0x2C), (k.r1.u32 - 0x5000) & ~0xFu), std::sqrt(dx * dx + dy * dy), hp0, rf(pl + 1356));
+        }
+      }
+      ctx = after;
+      return;
+    }
+  }
   if (!g_our_fire) {
     uint32_t p2 = BsP2Pawn(), w = ctx.r3.u32;
     if (p2 && BsP2KeyboardActive() && InHeap(p2) && w &&
@@ -2136,15 +2795,165 @@ static bool IsAIDecision(const std::string& n) {
   for (const char* x : k) if (n == x) return true;
   return false;
 }
+// UFunction* -> name, cached (also used when the tracer itself is off).
+static std::string FnNameCached(PPCContext& ctx, uint8_t* base, uint32_t fn) {
+  if (!HeapOrImg(fn)) return {};
+  {
+    std::lock_guard<std::mutex> lk(g_tr_mu);
+    auto it = g_tr_names.find(fn);
+    if (it != g_tr_names.end()) return it->second;
+  }
+  std::string n = FNameStr(ctx, base, fn, (ctx.r1.u32 - 0x6000) & ~0xFu);
+  std::lock_guard<std::mutex> lk(g_tr_mu);
+  return g_tr_names.emplace(fn, n).first->second;
+}
+static void WorldWatchNote(PPCContext& ctx, uint8_t* base) {
+  uint32_t self = ctx.r3.u32, n = g_watch_n.load();
+  if (!n || !self) return;
+  bool hit = false;
+  for (uint32_t i = 0; i < n && !hit; ++i) hit = g_watch[i].load() == self;
+  const bool is_jack = !hit && self == g_player.load();
+  if (!hit && !is_jack) return;
+  PPCContext k = ctx;
+  std::string fn = FnNameCached(ctx, base, k.r6.u32);
+  ctx = k;
+  if (fn.empty()) return;
+  LearnFunction(fn, k.r6.u32);
+  if (is_jack) {  // only door / touch / trigger-ish calls on Jack, he makes thousands of others
+    static const char* kJ[] = {"Door", "Touch", "Trigger", "Volume", "Bump", "Encroach", "Event", "Near", "Proximity",
+                               "Pickup", "PickUp", "Item", "Inventory", "Frob", "Use", "Log", "Audio", "Diary", "Grab", "Take"};
+    bool ok = false;
+    for (const char* j : kJ) ok = ok || fn.find(j) != std::string::npos;
+    if (!ok) return;
+  }
+  std::string cn = "Jack";
+  if (!is_jack) { std::lock_guard<std::mutex> lk(g_watch_mu); auto it = g_watch_cls.find(self); cn = it != g_watch_cls.end() ? it->second : "?"; }
+  static std::mutex mu; static std::unordered_map<std::string, int> seen;
+  int c;
+  { std::lock_guard<std::mutex> lk(mu); c = ++seen[cn + "." + fn]; if (seen.size() > 400) seen.clear(); }
+  if (c <= 2)
+    REXLOG_INFO("bioshock-recomp: world: {}.{} (this {:08X}, #{}) | stack {}", cn, fn, self, c, GuestBacktrace(base, k));
+  else if (c == 50 || c == 500)
+    REXLOG_INFO("bioshock-recomp: world: {}.{} called {} times", cn, fn, c);
+}
+// ProcessEvent (0x8247FFB0): every engine->script event (Touch, UsedBy, Frob, Landed...). Logged for the
+// world-watch set, Jack and the Big Daddy: first 2 per Class.Event with the first parameter and a stack.
+// This is where Jack's pickup of an audio diary should show up.
+extern "C" REX_FUNC(sub_8247FFB0) {
+  uint32_t self = ctx.r3.u32, n = g_watch_n.load();
+  if (self && (n || g_p2.load())) {
+    bool hit = self == g_player.load() || self == g_p2.load();
+    for (uint32_t i = 0; i < n && !hit; ++i) hit = g_watch[i].load() == self;
+    if (hit) {
+      PPCContext k = ctx;
+      std::string fn = FnNameCached(ctx, base, k.r4.u32);
+      ctx = k;
+      if (!fn.empty()) LearnFunction(fn, k.r4.u32);
+      static const char* kSkip[] = {"Tick", "Timer", "AnimEnd", "PlayerTick", "UpdateEyeHeight", "ZoneChange", "PhysicsVolumeChange"};
+      bool skip = fn.empty();
+      for (const char* x : kSkip) skip = skip || fn == x;
+      if (self == g_player.load() && (fn == "OnPickedUpInventoryItem" || fn == "AddLogEntry")) g_jack_got = true;
+      if (!skip) {
+        std::string who = self == g_player.load() ? "Jack" : self == g_p2.load() ? "BigDaddy" : "";
+        if (who.empty()) { std::lock_guard<std::mutex> lk(g_watch_mu); auto it = g_watch_cls.find(self); who = it != g_watch_cls.end() ? it->second : "?"; }
+        uint32_t a0 = InHeap(k.r5.u32) ? BE32(base, k.r5.u32) : 0;
+        std::string arg = a0 == g_player.load() ? "Jack" : a0 == g_p2.load() && a0 ? "BigDaddy" : fmt::format("{:08X}", a0);
+        static std::mutex mu; static std::unordered_map<std::string, int> seen;
+        int c; { std::lock_guard<std::mutex> lk(mu); c = ++seen[who + "." + fn]; if (seen.size() > 600) seen.clear(); }
+        if (c <= 2) REXLOG_INFO("bioshock-recomp: event: {}.{}(arg0 {}) #{} | stack {}", who, fn, arg, c, GuestBacktrace(base, k));
+      }
+      ctx = k;
+    }
+  }
+  __imp__sub_8247FFB0(ctx, base);
+}
+// Ghost scenes that wait until "the player can see us" (InPlayerViewTrigger.PlayerCanSeeUs) also count the
+// Big Daddy's view while you drive him: within 2000 units and inside a 100-degree cone of his camera.
+static bool P2CanSee(uint8_t* base, uint32_t target) {
+  uint32_t cam = g_cam_actor.load(), p2 = g_p2.load();
+  uint32_t src = InHeap(cam) ? cam : p2;
+  if (!InHeap(src) || !InHeap(target)) return false;
+  auto rf = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
+  float dx = rf(target + 0x1C0) - rf(src + 0x1C0), dy = rf(target + 0x1C4) - rf(src + 0x1C4), dz = rf(target + 0x1C8) - rf(src + 0x1C8);
+  float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+  if (d > 2000.0f || d < 1.0f) return d < 1.0f;
+  const float k = 6.2831853f / 65536.0f;
+  float yaw = int32_t(BE32(base, src + 0x1D0)) * k, pitch = int32_t(BE32(base, src + 0x1CC)) * k;
+  float fx = std::cos(pitch) * std::cos(yaw), fy = std::cos(pitch) * std::sin(yaw), fz = std::sin(pitch);
+  return (fx * dx + fy * dy + fz * dz) / d > 0.64f;  // cos 50 deg
+}
+// While the Big Daddy's own MoveActor runs, every Touch/UnTouch/volume event it dispatches is about him.
+// Door and trigger scripts then ask "may this pawn open doors / does it meet my criteria", which says no
+// for an AI Big Daddy. Answer yes for exactly those questions, exactly then (found with world watch,
+// 2026-11-03: TriggerRadius.MeetsTriggerCriteria -> DispatchEnter -> WelcomeDoors.AddUniquePawnToPawnsInsideDoor).
+static bool P2MoveOverride(PPCContext& ctx, uint8_t* base) {
+  static const char* kYes[] = {"CanOpenDoors", "IsPlayerPawn", "MeetsTriggerCriteria", "MeetsRestrictions", "CanTrigger",
+                               "MeetsTraceCriteria", "MeetsVisibilityCriteria"};
+  PPCContext k = ctx;
+  std::string fn = FnNameCached(ctx, base, k.r6.u32);
+  ctx = k;
+  bool yes = false;
+  for (const char* y : kYes) yes = yes || fn == y;
+  if (!yes) return false;
+  uint32_t res = k.r5.u32;
+  __imp__sub_82480E00(ctx, base);
+  if (res && res >= 0x30000000u) {
+    bool was = base[res + 3] != 0;
+    base[res] = 0; base[res + 1] = 0; base[res + 2] = 0; base[res + 3] = 1;
+    static std::mutex mu; static std::unordered_map<std::string, int> seen;
+    int c; { std::lock_guard<std::mutex> lk(mu); c = ++seen[fn]; }
+    if (c <= 3) Log(fmt::format("P2 touch: {} -> yes (game said {})", fn, was ? "yes" : "no"));
+  }
+  return true;
+}
 extern "C" REX_FUNC(sub_82480E00) {
-  if (g_trace.load()) {
+  if (g_in_p2_move.load() && g_p2_triggers.load() && P2MoveOverride(ctx, base)) return;
+  if (uint32_t cs = g_fn_canseeus.load(); cs && ctx.r6.u32 == cs && g_p2_triggers.load() && BsP2KeyboardActive()) {
+    uint32_t res = ctx.r5.u32, self = ctx.r3.u32;
+    __imp__sub_82480E00(ctx, base);
+    if (res >= 0x30000000u && !base[res + 3] && P2CanSee(base, self)) {
+      base[res] = 0; base[res + 1] = 0; base[res + 2] = 0; base[res + 3] = 1;
+      static int s_n = 0;
+      if (++s_n <= 3) Log("P2: a 'player can see us' scene counted the Big Daddy's view");
+    }
+    return;
+  }
+  if (g_watch_n.load()) WorldWatchNote(ctx, base);
+  // The tracer checkbox only controls the 5 s summaries. IsPlayerPawn-for-P2 and the AI-decision
+  // tripwires run whenever you drive (they used to switch off with the tracer).
+  const bool trace = g_trace.load(), driving = BsP2KeyboardActive();
+  if (trace || driving) {
     if (const char* tag = TraceTag(base, ctx.r3.u32)) {
       PPCContext k = ctx;
       uint32_t fn = ctx.r6.u32;
-      TraceNote(ctx, base, "call", tag, fn);
-      if (BsP2KeyboardActive()) {
-        std::string name;
-        { std::lock_guard<std::mutex> lk(g_tr_mu); auto it = g_tr_names.find(fn); if (it != g_tr_names.end()) name = it->second; }
+      if (trace) TraceNote(ctx, base, "call", tag, fn);
+      if (driving) {
+        std::string name = FnNameCached(ctx, base, fn);
+        ctx = k;
+        if (name == "TakeFallingDamage" && ctx.r3.u32 == g_p2.load()) {
+          // His jump is a scripted Z arc; the engine sees the landing as a fall and charges damage for it.
+          // Never skip a script call outright: CallFunction also consumes the caller's parameter bytecode, and
+          // skipping it corrupted the VM (silent exit, 2026-11-03). Run it, then restore his health.
+          uint32_t pp = ctx.r3.u32, hp_before = BE32(base, pp + 1356);
+          ctx = k;
+          __imp__sub_82480E00(ctx, base);
+          base[pp + 1356] = uint8_t(hp_before >> 24); base[pp + 1357] = uint8_t(hp_before >> 16);
+          base[pp + 1358] = uint8_t(hp_before >> 8); base[pp + 1359] = uint8_t(hp_before);
+          static uint32_t s_fd = 0;
+          if (++s_fd <= 3) Log("P2: falling damage from the jump undone");
+          return;
+        }
+        if (name == "IsPlayerPawn" && g_p2_as_player.load() && ctx.r3.u32 == g_p2.load()) {
+          // Script IsPlayerPawn() = Controller.bIsPlayer: run it, then answer yes for your Big Daddy.
+          uint32_t res = k.r5.u32;
+          ctx = k;
+          __imp__sub_82480E00(ctx, base);
+          if (res && InHeap(res) == false && res < 0x30000000u) res = 0;
+          if (res) { base[res] = 0; base[res + 1] = 0; base[res + 2] = 0; base[res + 3] = 1; }
+          static uint32_t s_ip = 0;
+          if ((++s_ip % 2000) == 1) REXLOG_INFO("bioshock-recomp: give: P2: IsPlayerPawn() -> true for your Big Daddy ({} calls)", s_ip);
+          return;
+        }
         if (!name.empty() && IsAIDecision(name)) {
           Probe((std::string("ai.decision.") + name).c_str(), base, k, "", 2);
           LearnFreeze(ctx, base, name.c_str(), true);
@@ -2217,4 +3026,19 @@ extern "C" REX_FUNC(sub_8258E290) {
     }
   }
   __imp__sub_8258E290(ctx, base);
+}
+
+// AShockPawn::execIsPlayer (0x82505AA0; natfind 2026-11-03): steps the script code, calls the native
+// IsPlayer (vtable+288) and stores the UBOOL at *Result (r5). Script IsPlayerPawn builds on it; splicers,
+// security and turrets use it to decide who to hunt. While you drive, your Big Daddy answers yes, so
+// enemies treat him like a player. Script casts to ShockPlayer still return None for him (no crash).
+extern "C" void __imp__sub_82505AA0(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" REX_FUNC(sub_82505AA0) {
+  uint32_t self = ctx.r3.u32, result = ctx.r5.u32;
+  __imp__sub_82505AA0(ctx, base);
+  if (g_p2_as_player.load() && self && self == g_p2.load() && BsP2KeyboardActive() && result) {
+    base[result] = 0; base[result + 1] = 0; base[result + 2] = 0; base[result + 3] = 1;
+    static uint32_t s_n = 0;
+    if ((++s_n % 2000) == 1) REXLOG_INFO("bioshock-recomp: give: P2: IsPlayer() -> true for your Big Daddy ({} calls)", s_n);
+  }
 }

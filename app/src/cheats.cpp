@@ -60,6 +60,7 @@ std::string ReadGuestW(uint8_t* base, uint32_t addr) {
 
 }  // namespace
 void BsRunGives(PPCContext& ctx, uint8_t* base);
+void BsLevelChanging(bool on);  // give.cpp
 // Fake FOutputDevice so command output (e.g. "get") can be read. Every vtable slot points at a
 // guest function we already wrap (sub_824CA220, give.cpp); that wrapper forwards here when
 // r3 is the fake device.
@@ -178,6 +179,14 @@ extern "C" REX_FUNC(sub_822B9F60) {
   g_exec_tid = tid;
   if (s_seen.size() < 200 && s_seen.insert(cmd).second) {
     REXLOG_INFO("bioshock-recomp: game Exec '{}' tid={} ar={:08X} (ours {:08X})", cmd, tid, ctx.r5.u32, g_capdev.load());
+  }
+  // Level travel / load: the old level's actors are freed while it runs. Our per-tick scans read actor
+  // memory, so they pause until the new level's player is captured (crash in FindActorList, 2026-11-03).
+  {
+    std::string lc = cmd.substr(0, 9);
+    for (auto& ch : lc) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+    if (lc.rfind("open ", 0) == 0 || lc.rfind("loadgame", 0) == 0 || lc.rfind("travel ", 0) == 0 || lc.rfind("start ", 0) == 0)
+      BsLevelChanging(true);
   }
   __imp__sub_822B9F60(ctx, base);
 }

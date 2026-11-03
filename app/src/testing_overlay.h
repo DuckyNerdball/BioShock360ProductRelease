@@ -28,11 +28,14 @@ void BsSplitInvert(bool inv);
 bool BsCoopSplit();
 bool BsSplitInverted();
 bool BsPadOnP2();               // co-op: controller currently drives the Big Daddy
-void BsPadSwap();               // co-op: move the controller to the other player (Back / F6)
+void BsPadSwap();
+void BsHudFlip();               // Big Daddy HUD to the other window (F5)               // co-op: move the controller to the other player (Back / F6)
 void BsSplitDefault(bool on);
 void BsJackBody(bool on);
 void BsP2Blind(bool on);
 void BsP2Squeeze(bool on);
+void BsP2AsPlayer(bool on);
+void BsP2Triggers(bool on);
 void BsP2FreezeThink(bool on);
 void BsP2FreezeAI(bool ctl, bool pawn);
 void BsSetTrace(bool on);
@@ -378,6 +381,10 @@ class TestingDialog : public rex::ui::ImGuiDialog {
       if (ImGui::Checkbox("+ his body's state code (auto-off when he dies)", &freeze_pawn)) BsP2FreezeAI(freeze_ctl, freeze_pawn);
       static bool think = true;
       if (ImGui::Checkbox("Freeze P2's native AI think while you drive (perception, targeting, decisions)", &think)) BsP2FreezeThink(think);
+      static bool trig = true;
+      if (ImGui::Checkbox("P2 sets off level triggers (ghost scenes, scripted moments) - use a spare save", &trig)) BsP2Triggers(trig);
+      static bool as_player = true;
+      if (ImGui::Checkbox("Enemies treat P2 as a player while you drive (IsPlayer = yes)", &as_player)) BsP2AsPlayer(as_player);
       static bool squeeze = true;
       if (ImGui::Checkbox("Squeeze: P2 fits through tight spaces while you drive (Jack-sized collision)", &squeeze)) BsP2Squeeze(squeeze);
       static bool blind = true;
@@ -398,6 +405,8 @@ class TestingDialog : public rex::ui::ImGuiDialog {
         if (ImGui::Checkbox("Swap windows (F7)", &inv)) BsSplitInvert(inv);
         ImGui::SameLine();
         if (ImGui::Button(BsPadOnP2() ? "Controller -> Jack (Back / F6)" : "Controller -> Big Daddy (Back / F6)")) BsPadSwap();
+        ImGui::SameLine();
+        if (ImGui::Button("HUD to other window (F5)")) BsHudFlip();
         ImGui::SameLine();
         ImGui::TextDisabled("%s", BsSplitStats().c_str());
       }

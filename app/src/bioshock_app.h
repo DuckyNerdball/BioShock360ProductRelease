@@ -13,6 +13,9 @@
 #include <rex/ui/keybinds.h>
 #include <rex/input/input_system.h>
 #include "testing_overlay.h"
+#include "bd_hud.h"
+#include <rex/ui/imgui_drawer.h>
+#include <rex/ui/immediate_drawer.h>
 #include <functional>
 #include <rex/graphics/split_view.h>
 #include <rex/logging.h>
@@ -22,7 +25,9 @@
 #include <rex/ui/window_listener.h>
 
 extern std::function<void(bool)> g_split_window_fn;  // give.cpp
+extern std::function<void(bool)> g_focus_window_fn;  // give.cpp
 void BsInstallCrashTrace();                           // crash_trace.cpp
+void BsHudFlip();                                     // give.cpp
 
 class BioshockApp : public rex::ReXApp {
  public:
@@ -55,10 +60,18 @@ class BioshockApp : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     // Always alive (it also polls the controller for the L3+R3 toggle); F9 only shows/hides it.
     testing_ = std::make_unique<TestingDialog>(drawer);
+    hud_main_ = std::make_unique<BigDaddyHud>(drawer, false);
     rex::ui::RegisterBind("bind_testing", "F9", "Toggle BioShock Testing overlay", [] { TestingDialog::Toggle(); });
     rex::ui::RegisterBind("bind_p2", "F8", "Keyboard+mouse: control P1 / P2", [] { BsP2ToggleKeyboard(); });
     g_split_window_fn = [this](bool on) { SetSplitWindow(on); };
-    rex::ui::RegisterBind("bind_pad_swap", "F6", "Co-op: controller drives Jack / the Big Daddy (main window follows)", [] { BsPadSwap(); });
+    g_focus_window_fn = [this](bool p2) {
+      app_context().CallInUIThread([this, p2] {
+        if (p2 && window2_) window2_->Focus();
+        else if (!p2 && window()) window()->Focus();
+      });
+    };
+    rex::ui::RegisterBind("bind_hud_flip", "F5", "Big Daddy HUD: move to the other window (once, if it starts on the wrong one)", [] { BsHudFlip(); });
+    rex::ui::RegisterBind("bind_pad_swap", "F6", "Co-op: controller drives Jack / the Big Daddy (focuses his window)", [] { BsPadSwap(); });
     rex::ui::RegisterBind("bind_split_swap", "F7", "Co-op split: swap which window shows which player", [] { BsSplitInvert(!BsSplitInverted()); });
   }
   // Split view: a second window with its own presenter. Frames the game tags as view 1 are routed
@@ -72,9 +85,13 @@ class BioshockApp : public rex::ReXApp {
       return false;
     }
   } split_close_;
-  // Declared presenter first so the window (destroyed first) detaches before the presenter dies.
+  // Declaration order = reverse destruction order: the HUD and its ImGui drawer go first (they hang off
+  // the window and presenter), then the window (detaches from the presenter), then drawer and presenter.
   std::unique_ptr<rex::ui::Presenter> presenter2_;
+  std::unique_ptr<rex::ui::ImmediateDrawer> drawer2_;
   std::unique_ptr<rex::ui::Window> window2_;
+  std::unique_ptr<rex::ui::ImGuiDrawer> imgui2_;
+  std::unique_ptr<BigDaddyHud> hud2_;
   void OnShutdown() override {
     rex::graphics::split_view::state().enabled = false;
     rex::graphics::split_view::state().second_presenter = nullptr;
@@ -95,6 +112,15 @@ class BioshockApp : public rex::ReXApp {
         if (!window2_->Open()) { REXLOG_ERROR("bioshock-recomp: split: window open failed"); return; }
         window2_->SetPresenter(presenter2_.get());
         sv::state().second_presenter = presenter2_.get();
+        // Big Daddy HUD in window 2: its own immediate drawer + ImGui context on the second presenter.
+        drawer2_ = prov->CreateImmediateDrawer();
+        if (drawer2_) {
+          drawer2_->SetPresenter(presenter2_.get());
+          imgui2_ = std::make_unique<rex::ui::ImGuiDrawer>(window2_.get(), 64);
+          imgui2_->SetPresenterAndImmediateDrawer(presenter2_.get(), drawer2_.get());
+          hud2_ = std::make_unique<BigDaddyHud>(imgui2_.get(), true);
+          REXLOG_INFO("bioshock-recomp: split: Big Daddy HUD on the second window");
+        }
         REXLOG_INFO("bioshock-recomp: split: second window open");
       }
       sv::state().enabled = true;
@@ -109,10 +135,11 @@ class BioshockApp : public rex::ReXApp {
     auto* d = imgui_drawer();
     // Co-op (two windows + F8): controllers stay with Jack, keyboard/mouse go to the Big Daddy.
     if (in && d) in->SetActiveCallbacks(
-        [d] { return !TestingDialog::Visible() && !(BsP2KeyboardActive() && !BsCoopSplit()) && !BsPadOnP2() && !d->GetIO().WantCaptureMouse; },
-        [d] { return !TestingDialog::Visible() && !BsP2KeyboardActive() && !d->GetIO().WantCaptureMouse; });
+        [d] { return !TestingDialog::Visible() && !(BsP2KeyboardActive() && !BsCoopSplit()) && !BsPadOnP2() && !g_bs_imgui_wants_mouse.load(); },
+        [d] { return !TestingDialog::Visible() && !BsP2KeyboardActive() && !g_bs_imgui_wants_mouse.load(); });
   }
   std::unique_ptr<TestingDialog> testing_;
+  std::unique_ptr<BigDaddyHud> hud_main_;
   // std::unique_ptr<rex::ui::ImGuiDialog> CreateAchievementsOverlay() override;
   // std::unique_ptr<rex::ui::AchievementNotificationDialog>
   // CreateAchievementNotificationDialog() override;

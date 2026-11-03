@@ -26,6 +26,10 @@ Full guide: [docs/LAUNCHER.md](docs/LAUNCHER.md).
 | F9 | Testing panel: god mode, noclip, teleport, level travel, give all weapons / ammo / plasmids, spawn enemies, freeze world, weapon mods |
 | F10 | Mark a glitch in the log |
 | F4 / F3 | Emulator settings / debug overlay |
+| D-pad down x5 | Co-op: spawn a Big Daddy and open his window (keyboard + mouse drive him; WASD, E use, LMB punch, LT/RMB drill, Space jump, C charge, R shove, T roar) |
+| Back / F6 | Co-op: move the controller between Jack and the Big Daddy |
+| F7 | Co-op: views on the wrong windows? swap them (the Big Daddy's HUD stays on his window) |
+| F8 | Keyboard + mouse: control Jack / the Big Daddy |
 
 Use a spare save for the F9 panel: level travel and loot changes can skip story state.
 

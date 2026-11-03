@@ -1,3 +1,69 @@
+diff --git a/include/rex/graphics/split_view.h b/include/rex/graphics/split_view.h
+new file mode 100644
+index 0000000..bb4710b
+--- /dev/null
++++ b/include/rex/graphics/split_view.h
+@@ -0,0 +1,60 @@
++// bioshock-recomp: alternate-frame split view.
++// The game sets current_view on the game thread before building a frame; VdSwap stamps it into
++// the swap packet, and IssueSwap (GPU thread) routes frames tagged 1 to second_presenter.
++// The state lives in rexruntime.dll (src/system/split_view.cpp) so the exe, the kernel and the
++// GPU plugin all see one copy (header inline globals would be duplicated per DLL).
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++
++namespace rex::ui {
++class Presenter;
++}
++
++namespace rex::graphics::split_view {
++
++inline constexpr uint32_t kTagMagic = 0x53504C00;  // 'SPL\0' | view
++
++struct State {
++  std::atomic<bool> enabled{false};
++  std::atomic<uint32_t> current_view{0};       // game thread: view of the frame being built
++  std::atomic<bool> invert{false};             // swap which window gets which view
++  std::atomic<ui::Presenter*> second_presenter{nullptr};
++  std::atomic<uint32_t> swap_view{0};          // GPU thread: view of the swap in flight
++  std::atomic<uint64_t> frames_routed[2] = {0, 0};
++  std::atomic<uint32_t> next_view{0};          // (unused since the frame queue; kept for layout)
++  // Frame queue: the game thread pushes the view of each frame it builds; VdSwap (guest render
++  // thread, which runs a frame or two behind) pops it. Lag-independent, unlike reading current_view
++  // at swap time, which tagged the NEXT frame's view whenever the render thread lagged a frame.
++  std::atomic<uint32_t> q_w{0}, q_r{0}, last_tag{0};
++  std::atomic<uint8_t> q[16] = {};
++};
++
++State& state();
++
++// Game thread, once per built frame. A full queue means swaps stopped (load / movie): start over.
++inline void PushFrameView(uint32_t view) {
++  State& st = state();
++  uint32_t w = st.q_w.load();
++  if (w - st.q_r.load() >= 6) st.q_r.store(w);
++  st.q[w & 15].store(uint8_t(view & 1));
++  st.q_w.store(w + 1);
++}
++// VdSwap: the view of the frame being swapped. Empty queue (loading-screen swaps from other threads)
++// = keep alternating from the last tag.
++inline uint32_t PopFrameView() {
++  State& st = state();
++  uint32_t r = st.q_r.load(), v;
++  if (r != st.q_w.load()) {
++    v = st.q[r & 15].load();
++    st.q_r.compare_exchange_strong(r, r + 1);
++  } else {
++    v = st.last_tag.load() ^ 1u;
++  }
++  st.last_tag.store(v);
++  return v;
++}
++inline void ResetFrameQueue() { State& st = state(); st.q_r.store(st.q_w.load()); }
++
++}  // namespace rex::graphics::split_view
 diff --git a/include/rex/input/input_driver.h b/include/rex/input/input_driver.h
 index 52116f1..c174976 100644
 --- a/include/rex/input/input_driver.h
@@ -782,7 +848,7 @@ index 8778066..4ba04b8 100644
        default: {
          REXKRNL_ERROR("XamUserWriteProfileSettings: Unimplemented data type {}", setting_type);
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
-index 1254710..5019175 100644
+index 1254710..c4ac9d0 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 @@ -19,6 +19,7 @@
@@ -793,7 +859,7 @@ index 1254710..5019175 100644
  #include <rex/graphics/video_mode_util.h>
  #include <rex/graphics/xenos.h>
  #include <rex/kernel/xboxkrnl/private.h>
-@@ -507,12 +508,18 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
+@@ -507,12 +508,22 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
    dwords[offset++] = gpu_fetch.dword_4;
    dwords[offset++] = gpu_fetch.dword_5;
  
@@ -807,7 +873,11 @@ index 1254710..5019175 100644
    dwords[offset++] = *height;
 +  {
 +    namespace sv = rex::graphics::split_view;
-+    uint32_t view = sv::state().enabled.load() ? ((sv::state().current_view.load() & 1) ^ (sv::state().invert.load() ? 1u : 0u)) : 0u;
++    // Always pop: the queue is a 1:1 stream with the game's frame builds whether routing is on or not.
++    // Popping only while enabled left the frame built before enabling unpopped, so every later swap took
++    // the NEXT frame's label (views on the wrong windows at spawn, 2026-11-03).
++    const uint32_t queued = sv::PopFrameView();
++    uint32_t view = sv::state().enabled.load() ? (queued ^ (sv::state().invert.load() ? 1u : 0u)) : 0u;
 +    dwords[offset++] = sv::kTagMagic | view;
 +  }
  
@@ -825,42 +895,6 @@ index fc46d86..1a95440 100644
  
      # Utilities
      util/object_table.cpp
-diff --git a/include/rex/graphics/split_view.h b/include/rex/graphics/split_view.h
-new file mode 100644
-index 0000000..93d4ed1
---- /dev/null
-+++ b/include/rex/graphics/split_view.h
-@@ -0,0 +1,30 @@
-+// bioshock-recomp: alternate-frame split view.
-+// The game sets current_view on the game thread before building a frame; VdSwap stamps it into
-+// the swap packet, and IssueSwap (GPU thread) routes frames tagged 1 to second_presenter.
-+// The state lives in rexruntime.dll (src/system/split_view.cpp) so the exe, the kernel and the
-+// GPU plugin all see one copy (header inline globals would be duplicated per DLL).
-+#pragma once
-+
-+#include <atomic>
-+#include <cstdint>
-+
-+namespace rex::ui {
-+class Presenter;
-+}
-+
-+namespace rex::graphics::split_view {
-+
-+inline constexpr uint32_t kTagMagic = 0x53504C00;  // 'SPL\0' | view
-+
-+struct State {
-+  std::atomic<bool> enabled{false};
-+  std::atomic<uint32_t> current_view{0};       // game thread: view of the frame being built
-+  std::atomic<bool> invert{false};             // swap which window gets which view
-+  std::atomic<ui::Presenter*> second_presenter{nullptr};
-+  std::atomic<uint32_t> swap_view{0};          // GPU thread: view of the swap in flight
-+  std::atomic<uint64_t> frames_routed[2] = {0, 0};
-+};
-+
-+State& state();
-+
-+}  // namespace rex::graphics::split_view
 diff --git a/src/system/split_view.cpp b/src/system/split_view.cpp
 new file mode 100644
 index 0000000..bb66f64
