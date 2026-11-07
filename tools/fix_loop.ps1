@@ -6,15 +6,17 @@ param(
     [int]$MaxIterations = 20,
     [int]$RunSeconds    = 60,
     [string]$Preset     = "win-amd64-relwithdebinfo",
-    [ValidateSet('Pure','Crisp','Sharp','Clean','Ultra','Cinematic')][string]$Look = 'Pure',
-    [switch]$RenderDoc   # run under RenderDoc: F10 marks the log AND captures that frame to captures\
+    [ValidateSet('Pure','Crisp','Sharp','Clean','Ultra','Cinematic','BS2')][string]$Look,
+    [switch]$RenderDoc,  # run under RenderDoc: F10 marks the log AND captures that frame to captures\
+    [string]$Project    = "bioshock",     # bioshock2-recomp: -Project bioshock2 -GameDir game_bs2
+    [string]$GameDir    = "game_base1"
 )
 . (Join-Path $PSScriptRoot 'look.ps1')
 $ErrorActionPreference = "Stop"
 $Root     = Split-Path -Parent $PSScriptRoot
 $App      = Join-Path $Root "app"
-$Manifest = Join-Path $App "bioshock_manifest.toml"
-$Exe      = Join-Path $App "out\build\$Preset\bioshock.exe"
+$Manifest = Join-Path $App "${Project}_manifest.toml"
+$Exe      = Join-Path $App "out\build\$Preset\$Project.exe"
 $LogDir   = Join-Path $Root "logs"
 $UserData = Join-Path $Root "run\userdata"
 New-Item -ItemType Directory $LogDir, $UserData -Force | Out-Null
@@ -24,7 +26,7 @@ function Invoke-Build([string]$Tag) {
     Push-Location $App
     try {
         foreach ($step in @(
-            @("--build", "--preset", $Preset, "--target", "bioshock_codegen"),
+            @("--build", "--preset", $Preset, "--target", "${Project}_codegen"),
             @("--preset", $Preset),
             @("--build", "--preset", $Preset))) {
             $log = Join-Path $LogDir "build_$Tag.log"
@@ -53,7 +55,9 @@ for ($i = 1; $i -le $MaxIterations; $i++) {
     $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $runLog = Join-Path $LogDir "run_$stamp.log"
     Write-Host "`n=== Iteration $i : run -> $runLog" -ForegroundColor Cyan
-    $gameArgs = @(Get-LookArgs $Looks[$Look]) + @("--game_data_root", "`"$Root\game_base1`"", "--user_data_root", "`"$UserData`"", "--log_file", "`"$runLog`"")
+    if (-not $Look) { $Look = if ($Project -eq 'bioshock2') { 'BS2' } else { 'Pure' } }
+    $LL = $Looks[$Look]
+    $gameArgs = @(Get-LookArgs $LL -SkipComposite ([bool]$LL.SkipComposite)) + @("--game_data_root", "`"$Root\$GameDir`"", "--user_data_root", "`"$UserData`"", "--log_file", "`"$runLog`"")
     if ($RenderDoc) {
         New-Item -ItemType Directory (Join-Path $Root "captures") -Force | Out-Null
         $p = Start-Process "C:\Program Files\RenderDoc\renderdoccmd.exe" -PassThru -ArgumentList (@("capture", "-w", "-d", "`"$Root`"", "-c", "`"$Root\captures\loop_$stamp`"", "`"$Exe`"") + $gameArgs)
@@ -83,5 +87,5 @@ for ($i = 1; $i -le $MaxIterations; $i++) {
     Add-Content (Join-Path $Root "docs\STATUS.md") "- $(Get-Date -Format yyyy-MM-dd) - $addr - runtime: call to unregistered function - declared in [entrypoint.functions] (fix_loop)"
     Invoke-Build $stamp
 }
-Write-Host "`nDone. Review: git diff app\bioshock_manifest.toml docs\STATUS.md"
+Write-Host "`nDone. Review: git diff app\${Project}_manifest.toml docs\STATUS.md"
 

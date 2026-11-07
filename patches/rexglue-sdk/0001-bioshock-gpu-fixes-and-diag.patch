@@ -910,3 +910,74 @@ index 0000000..bb66f64
 +  return s;
 +}
 +}  // namespace rex::graphics::split_view
+diff --git a/src/system/xex_module.cpp b/src/system/xex_module.cpp
+index 0726516..9966fd1 100644
+--- a/src/system/xex_module.cpp
++++ b/src/system/xex_module.cpp
+@@ -1156,10 +1156,66 @@ void XexModule::PopulateBinaryData() {
+     sec.virtual_size = pe_sec.size;
+     sec.host_data = memory()->TranslateVirtual<uint8_t*>(pe_sec.address);
+     sec.executable = (pe_sec.flags & kXEPESectionMemoryExecute) != 0;
++    // bioshock2-recomp: the XEX entry point is code whatever its PE section flags say (BioShock 2's
++    // entry 0x82010D10 sits in a section without the execute flag; codegen stubbed it and the
++    // runtime had no function registered there).
++    const uint32_t ep = entry_point();
++    if (!sec.executable && ep >= pe_sec.address && ep < pe_sec.address + pe_sec.size) {
++      REXLOG_INFO("section '{}' at {:08X} holds the entry point {:08X}: treating it as code", pe_sec.name, pe_sec.address, ep);
++      sec.executable = true;
++    }
+     sec.writable = (pe_sec.flags & kXEPESectionMemoryWrite) != 0;
+     binary_sections_.push_back(std::move(sec));
+   }
+ 
++  // bioshock2-recomp: the entry point can live outside every PE section (BioShock 2: 0x82010D10, below
++  // the first PE section). Codegen then never decodes it and the runtime has no function there. Synthesize
++  // a code section from the XEX page descriptors' CODE run that contains the entry point.
++  {
++    const uint32_t ep = entry_point();
++    bool covered = false;
++    for (const auto& sec : binary_sections_)
++      if (ep >= sec.virtual_address && ep < sec.virtual_address + sec.virtual_size) covered = true;
++    if (ep && !covered) {
++      auto* heap = memory()->LookupHeap(base_address_);
++      const uint32_t page_size = heap ? heap->page_size() : 0x1000;
++      const auto* si = xex_security_info();
++      uint32_t run_start = 0, run_end = 0;
++      for (uint32_t i = 0, page = 0; i < si->page_descriptor_count; i++) {
++        xex2_page_descriptor desc;
++        desc.value = rex::byte_swap(si->page_descriptors[i].value);
++        const uint32_t a = base_address_ + page * page_size, sz = desc.page_count * page_size;
++        if (desc.info == XEX_SECTION_CODE) {
++          if (run_end == a) run_end = a + sz; else { run_start = a; run_end = a + sz; }
++          if (ep >= run_start && ep < run_end) {
++            // extend through the following contiguous CODE pages
++            uint32_t p2 = page + desc.page_count;
++            for (uint32_t j = i + 1; j < si->page_descriptor_count; j++) {
++              xex2_page_descriptor d2; d2.value = rex::byte_swap(si->page_descriptors[j].value);
++              if (d2.info != XEX_SECTION_CODE) break;
++              run_end = base_address_ + (p2 + d2.page_count) * page_size; p2 += d2.page_count;
++            }
++            break;
++          }
++        } else { run_start = run_end = 0; }
++        page += desc.page_count;
++      }
++      if (run_end > run_start && ep >= run_start && ep < run_end) {
++        BinarySection sec;
++        sec.name = ".entry";
++        sec.virtual_address = run_start;
++        sec.virtual_size = run_end - run_start;
++        sec.host_data = memory()->TranslateVirtual<uint8_t*>(run_start);
++        sec.executable = true;
++        sec.writable = false;
++        REXLOG_INFO("entry point {:08X} is outside every PE section: added code section .entry {:08X}-{:08X}", ep, run_start, run_end);
++        binary_sections_.push_back(std::move(sec));
++      } else {
++        REXLOG_WARN("entry point {:08X} is outside every PE section and no XEX CODE page run covers it", ep);
++      }
++    }
++  }
++
+   // Populate symbols from import libraries
+   for (const auto& lib : import_libs_) {
+     for (const auto& import : lib.imports) {

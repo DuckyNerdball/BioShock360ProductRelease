@@ -398,7 +398,15 @@ int BsMouseDX() {
   HWND fg = GetForegroundWindow();
   DWORD pid = 0;
   GetWindowThreadProcessId(fg, &pid);
-  if (!fg || pid != GetCurrentProcessId() || (GetAsyncKeyState(VK_MENU) & 0x8000) || BsPanelIsOpen()) {
+  // Co-op split: only the Big Daddy's own window grabs the mouse. Grabbing whichever game window had focus locked the
+  // cursor inside Jack's window too (Hayden 11-06). Click the Big Daddy window to give him the mouse; click Jack's
+  // window (or hold Alt) to get it back.
+  // The Big Daddy view can sit in either window (F7), so follow the view, not the window title.
+  extern bool BsCoopSplit();
+  extern bool BsBdInMain();
+  bool bd_window = true;
+  if (fg && BsCoopSplit()) { wchar_t t[128] = {}; GetWindowTextW(fg, t, 127); bd_window = (wcsstr(t, L"Player 2") != nullptr) != BsBdInMain(); }
+  if (!fg || pid != GetCurrentProcessId() || !bd_window || (GetAsyncKeyState(VK_MENU) & 0x8000) || BsPanelIsOpen()) {
     s_free = true; g_mouse_dy_bs = 0; return 0;
   }
   RECT r; GetClientRect(fg, &r);

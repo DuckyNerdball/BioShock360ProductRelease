@@ -29,6 +29,8 @@ bool BsCoopSplit();
 bool BsSplitInverted();
 bool BsPadOnP2();               // co-op: controller currently drives the Big Daddy
 void BsPadSwap();
+void BsToggleP2Fullscreen(); bool BsP2Fullscreen();
+void BsSetBdPad(int idx); int BsBdPad(); int BsBdPadNow(); void BsSetBdPadJoin(bool on); bool BsBdPadJoin();
 void BsHudFlip();               // Big Daddy HUD to the other window (F5)               // co-op: move the controller to the other player (Back / F6)
 void BsSplitDefault(bool on);
 void BsJackBody(bool on);
@@ -405,6 +407,19 @@ class TestingDialog : public rex::ui::ImGuiDialog {
         if (ImGui::Checkbox("Swap windows (F7)", &inv)) BsSplitInvert(inv);
         ImGui::SameLine();
         if (ImGui::Button(BsPadOnP2() ? "Controller -> Jack (Back / F6)" : "Controller -> Big Daddy (Back / F6)")) BsPadSwap();
+        {
+          // Second controller (couch, or a friend over Parsec / Moonlight) always drives the Big Daddy.
+          const char* items[] = {"auto (first pad after Jack's)", "controller 2", "controller 3", "controller 4"};
+          int sel = BsBdPad() < 1 ? 0 : BsBdPad();
+          ImGui::SetNextItemWidth(220);
+          if (ImGui::Combo("Big Daddy controller", &sel, items, 4)) BsSetBdPad(sel == 0 ? -1 : sel);
+          ImGui::SameLine();
+          ImGui::TextDisabled(BsBdPadNow() >= 0 ? "(connected: controller %d)" : "(none connected)", BsBdPadNow() + 1);
+          bool join = BsBdPadJoin();
+          if (ImGui::Checkbox("A / Start on that controller spawns the Big Daddy", &join)) BsSetBdPadJoin(join);
+          if (ImGui::Button(BsP2Fullscreen() ? "Big Daddy window: windowed (F11)" : "Big Daddy window: fullscreen (F11)")) BsToggleP2Fullscreen();
+          ImGui::SameLine(); ImGui::TextDisabled("stream this window to a friend (Parsec / Moonlight); their pad drives him");
+        }
         ImGui::SameLine();
         if (ImGui::Button("HUD to other window (F5)")) BsHudFlip();
         ImGui::SameLine();

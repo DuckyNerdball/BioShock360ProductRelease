@@ -8,8 +8,9 @@
 #   .\tools\play.ps1 -Fps30          # original 30 fps cap (default is 60 fps via 120 Hz guest vblank)
 #   .\tools\play.ps1 -Extra '--some_cvar=1','--other=2'   # pass raw cvars through
 #   .\tools\play.ps1 -RestoreAA         # put the original ConfigINI.IBF back and exit
-param([ValidateSet('Pure','Crisp','Sharp','Clean','Ultra','Cinematic')][string]$Look = 'Pure', [ValidateRange(1,6)][int]$Scale, [int]$Delta, [ValidateRange(-1,5)][int]$Aniso = 5, [ValidateSet('bilinear','cas','fsr')][string]$Present = 'cas', [double]$Sharpness, [double]$Bloom, [double]$Exposure, [double]$Gamma, [switch]$Fps30, [switch]$Dof, [switch]$NoDof, [ValidateSet('none','fxaa','fxaa_extreme')][string]$AA, [switch]$NoDirectResolve, [switch]$SkipComposite, [switch]$RestoreAA, [string]$Preset = "win-amd64-relwithdebinfo", [string[]]$Extra = @())
+param([ValidateSet('Pure','Crisp','Sharp','Clean','Ultra','Cinematic','BS2')][string]$Look, [ValidateRange(1,6)][int]$Scale, [int]$Delta, [ValidateRange(-1,5)][int]$Aniso = 5, [ValidateSet('bilinear','cas','fsr')][string]$Present = 'cas', [double]$Sharpness, [double]$Bloom, [double]$Exposure, [double]$Gamma, [switch]$Fps30, [switch]$Dof, [switch]$NoDof, [ValidateSet('none','fxaa','fxaa_extreme')][string]$AA, [switch]$NoDirectResolve, [switch]$SkipComposite, [switch]$RestoreAA, [string]$Preset = "win-amd64-relwithdebinfo", [string[]]$Extra = @(), [string]$Project = "bioshock", [string]$GameDir = "game_base1")
 . (Join-Path $PSScriptRoot 'look.ps1')
+if (-not $Look) { $Look = if ($Project -eq 'bioshock2') { 'BS2' } else { 'Pure' } }  # per-game default look
 $L = $Looks[$Look].Clone()
 if ($PSBoundParameters.ContainsKey('Scale')) { $L.Scale = $Scale }
 if ($PSBoundParameters.ContainsKey('Sharpness')) { $L.Sharpness = $Sharpness }
@@ -21,12 +22,14 @@ if ($PSBoundParameters.ContainsKey('Delta')) { $L.Delta = $Delta }
 if ($Dof) { $L.Dof = $true }; if ($NoDof) { $L.Dof = $false }
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
-$Ibf  = Join-Path $Root "game_base1\ConfigINI.IBF"
+$Ibf  = Join-Path $Root "$GameDir\ConfigINI.IBF"
 $Orig = "$Ibf.orig"
-$Exe  = Join-Path $Root "app\out\build\$Preset\bioshock.exe"
-if (-not (Test-Path $Ibf)) { throw "Not found: $Ibf" }
-if (-not (Test-Path $Orig)) { Copy-Item $Ibf $Orig; Write-Host "Backed up original to $Orig" }
-if ($RestoreAA) { Copy-Item $Orig $Ibf -Force; Write-Host "Restored original ConfigINI.IBF"; return }
+$Exe  = Join-Path $Root "app\out\build\$Preset\$Project.exe"
+$HasIbf = Test-Path $Ibf
+if (-not $HasIbf) { Write-Host "No ConfigINI.IBF in $GameDir - skipping the AA/edge-blur ini patch" -ForegroundColor DarkGray }
+if ($HasIbf -and -not (Test-Path $Orig)) { Copy-Item $Ibf $Orig; Write-Host "Backed up original to $Orig" }
+if ($RestoreAA) { if ($HasIbf) { Copy-Item $Orig $Ibf -Force; Write-Host "Restored original ConfigINI.IBF" }; return }
+if ($HasIbf) {
 
 # Always patch from the pristine copy (idempotent). Same-length edits only: file size must not change.
 $enc = [Text.Encoding]::GetEncoding(28591)
@@ -43,10 +46,11 @@ foreach ($p in $pairs) {
 $bytes = $enc.GetBytes($s)
 if ($bytes.Length -ne (Get-Item $Orig).Length) { throw "Length changed - aborting" }
 [IO.File]::WriteAllBytes($Ibf, $bytes)
+}
 
 New-Item -ItemType Directory (Join-Path $Root "logs"), (Join-Path $Root "run\userdata") -Force | Out-Null
 $log = Join-Path $Root ("logs\play_{0}.log" -f (Get-Date -Format yyyyMMdd_HHmmss))
 Write-Host "Look $Look : scale $($L.Scale) ($(1280*$L.Scale)x$(720*$L.Scale)), AA $($L.AA), CAS $($L.Sharpness), bloom $(if ($L.Dof) { $L.Bloom } else { 'off' }), exposure $($L.Exposure), gamma $($L.Gamma), delta $($L.Delta), dither $($L.Dither). Log: $log"
-Start-Process $Exe -Wait -WorkingDirectory $Root -ArgumentList (@(Get-LookArgs $L -Aniso $Aniso -Present $Present -DirectResolve (-not $NoDirectResolve) -SkipComposite $SkipComposite.IsPresent -GuestHz $(if ($Fps30) { 60 } else { 120 })) + @(
-    '--game_data_root', "`"$Root\game_base1`"", '--user_data_root', "`"$Root\run\userdata`"",
+Start-Process $Exe -Wait -WorkingDirectory $Root -ArgumentList (@(Get-LookArgs $L -Aniso $Aniso -Present $Present -DirectResolve (-not $NoDirectResolve) -SkipComposite ($SkipComposite.IsPresent -or [bool]$L.SkipComposite) -GuestHz $(if ($Fps30) { 60 } else { 120 })) + @(
+    '--game_data_root', "`"$Root\$GameDir`"", '--user_data_root', "`"$Root\run\userdata`"",
     '--log_file', "`"$log`"") + $Extra)

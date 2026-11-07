@@ -26,6 +26,9 @@
 
 extern std::function<void(bool)> g_split_window_fn;  // give.cpp
 extern std::function<void(bool)> g_focus_window_fn;  // give.cpp
+bool BsP2KbmDrives();                                 // give.cpp: keyboard+mouse drive the Big Daddy (no dedicated pad)
+extern std::function<void(bool)> g_fullscreen2_fn;    // give.cpp
+void BsToggleP2Fullscreen();                          // give.cpp
 void BsInstallCrashTrace();                           // crash_trace.cpp
 void BsHudFlip();                                     // give.cpp
 
@@ -64,15 +67,19 @@ class BioshockApp : public rex::ReXApp {
     rex::ui::RegisterBind("bind_testing", "F9", "Toggle BioShock Testing overlay", [] { TestingDialog::Toggle(); });
     rex::ui::RegisterBind("bind_p2", "F8", "Keyboard+mouse: control P1 / P2", [] { BsP2ToggleKeyboard(); });
     g_split_window_fn = [this](bool on) { SetSplitWindow(on); };
+    g_fullscreen2_fn = [this](bool on) {
+      app_context().CallInUIThread([this, on] { if (window2_) window2_->SetFullscreen(on); });
+    };
+    rex::ui::RegisterBind("bind_p2_fullscreen", "F11", "Co-op: Big Daddy window fullscreen (for streaming to a friend)", [] { BsToggleP2Fullscreen(); });
     g_focus_window_fn = [this](bool p2) {
       app_context().CallInUIThread([this, p2] {
         if (p2 && window2_) window2_->Focus();
         else if (!p2 && window()) window()->Focus();
       });
     };
-    rex::ui::RegisterBind("bind_hud_flip", "F5", "Big Daddy HUD: move to the other window (once, if it starts on the wrong one)", [] { BsHudFlip(); });
+    // F5 (HUD flip) and F7 (view swap) are polled in give.cpp (BsPollCoopKeys): binds only fire in the main window,
+    // and with the Big Daddy window focused they did nothing (Hayden, 2026-11-06).
     rex::ui::RegisterBind("bind_pad_swap", "F6", "Co-op: controller drives Jack / the Big Daddy (focuses his window)", [] { BsPadSwap(); });
-    rex::ui::RegisterBind("bind_split_swap", "F7", "Co-op split: swap which window shows which player", [] { BsSplitInvert(!BsSplitInverted()); });
   }
   // Split view: a second window with its own presenter. Frames the game tags as view 1 are routed
   // to it by IssueSwap (SDK patch, split_view.h). Created once and kept alive; closing it only
@@ -136,7 +143,7 @@ class BioshockApp : public rex::ReXApp {
     // Co-op (two windows + F8): controllers stay with Jack, keyboard/mouse go to the Big Daddy.
     if (in && d) in->SetActiveCallbacks(
         [d] { return !TestingDialog::Visible() && !(BsP2KeyboardActive() && !BsCoopSplit()) && !BsPadOnP2() && !g_bs_imgui_wants_mouse.load(); },
-        [d] { return !TestingDialog::Visible() && !BsP2KeyboardActive() && !g_bs_imgui_wants_mouse.load(); });
+        [d] { return !TestingDialog::Visible() && !BsP2KbmDrives() && !g_bs_imgui_wants_mouse.load(); });
   }
   std::unique_ptr<TestingDialog> testing_;
   std::unique_ptr<BigDaddyHud> hud_main_;

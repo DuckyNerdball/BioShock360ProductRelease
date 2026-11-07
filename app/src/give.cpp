@@ -26,6 +26,63 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <chrono>
+#include <fstream>
+#include <map>
+#include <set>
+
+// ---- Live knobs (ported from the BS2 recomp, 2026-11-06) -------------------------------------------------------
+// run\knobs.txt, one "name=value" per line, re-read twice a second on the game thread. BsKnob(name, default)
+// returns the live value or the default, so tuning needs no rebuild. "quit=1" closes the game.
+// Tunables wired so far: bdcam bdcamcharge bdhead bdcamz bdfollow bdwalk bdrun bdmouse bdpadlook. Probes: hurtjack pcdump.
+static std::map<std::string, float> g_knobs;
+static void BsPollDevCmds();
+static void BsLoadUiBlock();
+void BsPollKnobs() {
+  static auto last = std::chrono::steady_clock::now(); auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::milliseconds(500)) return; last = now;
+  BsPollDevCmds();
+  std::ifstream f("run\\knobs.txt"); std::map<std::string, float> m;
+  if (f) { std::string l; while (std::getline(f, l)) { auto e = l.find('='); if (e == std::string::npos) continue;
+    try { m[l.substr(0, e)] = std::stof(l.substr(e + 1)); } catch (...) {} } }
+  if (m != g_knobs) { g_knobs = m; std::string w; for (auto& [k, v] : m) w += k + "=" + std::to_string(v) + " ";
+    REXLOG_INFO("bioshock-recomp: knobs: {}", w);
+    if (auto it = m.find("quit"); it != m.end() && it->second == 1.0f) { REXLOG_INFO("bioshock-recomp: knobs: quit=1 - exiting"); std::exit(0); } }
+}
+// run\cmd.txt (dev): whenever its content changes, every line runs once on the game thread (BsRunDevCmds):
+//   peek ADDR [N] | poke ADDR VAL | bdclr ADDR MASK | bdset ADDR MASK | bdoff | ev ADDR | evoff | jackui | dumpobj ADDR | con TEXT
+// (hex numbers). bdclr/bdset apply only on the Big Daddy's frames and are restored on Jack's.
+static std::mutex g_devcmd_mu;
+static std::vector<std::string> g_devcmds;
+static void BsPollDevCmds() {
+  static std::string s_last;
+  static bool s_ui_loaded = false; if (!s_ui_loaded) { s_ui_loaded = true; BsLoadUiBlock(); }
+  std::ifstream f("run\\cmd.txt"); if (!f) return;
+  std::string all((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  if (all == s_last) return; s_last = all;
+  std::lock_guard<std::mutex> lk(g_devcmd_mu);
+  size_t a = 0; while (a < all.size()) { size_t b = all.find('\n', a); if (b == std::string::npos) b = all.size();
+    std::string l = all.substr(a, b - a); while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back(); if (!l.empty()) g_devcmds.push_back(l); a = b + 1; }
+}
+// UI console-command filter: the FlashGUIController receives ConsoleCommand events that open Scaleform popups
+// (the "You are being REVIVED at a Vita-Chamber" help box, 2026-11-06). Every one is logged ("ui cmd:"); any whose
+// text contains a line of run\uiblock.txt is dropped. "block TEXT" in run\cmd.txt appends a line.
+static std::mutex g_uiblock_mu;
+static std::vector<std::string> g_uiblock;
+static void BsLoadUiBlock() {
+  std::ifstream f("run\\uiblock.txt"); std::string l; std::vector<std::string> v;
+  while (std::getline(f, l)) { while (!l.empty() && (l.back() == '\r' || l.back() == ' ')) l.pop_back(); if (!l.empty()) v.push_back(l); }
+  std::lock_guard<std::mutex> lk(g_uiblock_mu); g_uiblock.swap(v);
+}
+static bool BsUiBlocked(const std::string& c) {
+  std::lock_guard<std::mutex> lk(g_uiblock_mu);
+  for (auto& b : g_uiblock) if (c.find(b) != std::string::npos) return true;
+  return false;
+}
+struct BdMask { std::atomic<uint32_t> addr{0}, mask{0}; std::atomic<bool> set{false}; };
+static BdMask g_bdmask[8];
+std::atomic<uint32_t> g_evwatch[4];
+float BsKnob(const char* k, float def) { auto it = g_knobs.find(k); return it != g_knobs.end() ? it->second : def; }
 
 extern "C" void __imp__sub_82466660(PPCContext& __restrict ctx, uint8_t* base);
 extern "C" void __imp__sub_824C6D68(PPCContext& __restrict ctx, uint8_t* base);
@@ -227,9 +284,24 @@ extern "C" REX_FUNC(sub_824BE0D8) {
 // Called on the game thread from cheats.cpp RunQueued (frame tick). Runs one queued give.
 void BsTickP2(PPCContext& ctx, uint8_t* base);
 void BsPollPadSpawnCombo();
+// F5 / F7 from EITHER game window (the main-window binds missed key presses while the Big Daddy window had focus).
+void BsHudFlip(); void BsSplitInvert(bool inv); bool BsSplitInverted();
+static void BsPollCoopKeys() {
+  DWORD pid = 0; GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+  const bool ours = pid == GetCurrentProcessId();
+  static bool p5 = false, p7 = false;
+  const bool k5 = ours && (GetAsyncKeyState(VK_F5) & 0x8000), k7 = ours && (GetAsyncKeyState(VK_F7) & 0x8000);
+  if (k5 && !p5) BsHudFlip();
+  if (k7 && !p7) BsSplitInvert(!BsSplitInverted());
+  p5 = k5; p7 = k7;
+}
+static void BsProbeJack(PPCContext& ctx, uint8_t* base);
+static void BsRunDevCmds(PPCContext& ctx, uint8_t* base);
 void BsRunGives(PPCContext& ctx, uint8_t* base) {
+  BsPollKnobs();
+  BsPollCoopKeys();
   BsPollPadSpawnCombo();
-  if (!g_level_changing.load()) BsTickP2(ctx, base);
+  if (!g_level_changing.load()) { BsTickP2(ctx, base); BsProbeJack(ctx, base); BsRunDevCmds(ctx, base); }
   std::string cls;
   {
     std::lock_guard<std::mutex> lk(g_gmu);
@@ -698,6 +770,15 @@ std::atomic<uint32_t> g_ai_swings{0};      // AI-started weapon calls on P2 whil
 // Split view (two windows): the app installs the window opener; the frame tag lives in the SDK.
 std::function<void(bool)> g_split_window_fn;
 std::function<void(bool)> g_focus_window_fn;  // UI: focus the Big Daddy (true) or main (false) window
+std::function<void(bool)> g_fullscreen2_fn;   // UI: Big Daddy window fullscreen on/off
+std::atomic<bool> g_p2_fullscreen{false};
+void BsToggleP2Fullscreen() {
+  bool on = !g_p2_fullscreen.load();
+  g_p2_fullscreen = on;
+  if (g_fullscreen2_fn) g_fullscreen2_fn(on);
+  Log(on ? "Big Daddy window: fullscreen (F11 again to restore)" : "Big Daddy window: windowed");
+}
+bool BsP2Fullscreen() { return g_p2_fullscreen.load(); }
 void BsSplitWindow(bool on) {
   if (on) g_view_mode = 1;  // alternate frames
   else if (g_view_mode.load() == 1) g_view_mode = 0;
@@ -707,7 +788,12 @@ void BsSplitWindow(bool on) {
 bool BsCoopSplit() { return rex::graphics::split_view::state().enabled.load(); }
 // F7: window 2 always shows the Big Daddy (and his HUD). If the views ever land on the wrong windows, the
 // frame labels are off by one; F7 flips the labels so the views trade places and the HUD stays put.
-std::atomic<bool> g_label_fix{false};
+// The F7/F5 choice is remembered in run\coop_views.txt and applied on the next start (Hayden 11-06: co-op opened with
+// the views and HUD on the wrong windows two sessions running; each fix by hand). Line 1 = F7 label, line 2 = F5 HUD.
+bool BsHudFlipped();
+static bool LoadCoopView(int line) { std::ifstream f("run\\coop_views.txt"); std::string l; for (int i = 0; i <= line && std::getline(f, l); ++i) if (i == line) return l == "1"; return false; }
+std::atomic<bool> g_label_fix{LoadCoopView(0)};
+static void SaveCoopViews(bool label, bool hud) { std::ofstream f("run\\coop_views.txt"); f << (label ? 1 : 0) << "\n" << (hud ? 1 : 0) << "\n"; }
 static auto g_label_manual_t = std::chrono::steady_clock::now() - std::chrono::hours(1);
 void BsSplitInvert(bool inv) {
   g_label_manual_t = std::chrono::steady_clock::now();  // manual F7 wins over the auto check for a minute
@@ -715,18 +801,32 @@ void BsSplitInvert(bool inv) {
   rex::graphics::split_view::state().invert = false;
   rex::graphics::split_view::ResetFrameQueue();
   Log(inv ? "split: views relabeled (F7) - Big Daddy view back on window 2" : "split: view labels back to normal (F7)");
+  SaveCoopViews(inv, BsHudFlipped());
 }
 bool BsSplitInverted() { return g_label_fix.load(); }
 // Co-op: which player the controller (pad 0) drives. Back / F6 flips it, and the views swap so the
 // player you are holding the controller for is always in the main window.
 std::atomic<bool> g_pad_p2{false};
+// Big Daddy controller (couch or remote guest via Parsec / Moonlight): a second pad drives him, always.
+// g_bd_pad: -1 = auto (the first connected pad other than Jack's), 1..3 = fixed XInput index.
+std::atomic<int> g_bd_pad{-1};
+std::atomic<int> g_bd_pad_now{-1};      // resolved this tick, -1 = none connected
+std::atomic<bool> g_bd_pad_join{true};  // a press on that pad spawns him when there is none
+void BsSetBdPad(int idx) { g_bd_pad = idx; }
+int BsBdPad() { return g_bd_pad.load(); }
+int BsBdPadNow() { return g_bd_pad_now.load(); }
+void BsSetBdPadJoin(bool on) { g_bd_pad_join = on; }
+bool BsBdPadJoin() { return g_bd_pad_join.load(); }
+// The keyboard + mouse drive him only when no dedicated pad does; otherwise they stay with Jack.
+bool BsP2KbmDrives() { return g_p2_kbd.load() && g_p2.load() && g_bd_pad_now.load() < 0; }
 std::atomic<bool> g_bd_in_main{false};  // (unused by the HUD now; kept for logs)
 // HUD side: which window shows the Big Daddy cannot be read back (frame parity between the game and
 // present threads varies per session), but Back/F6 and F7 all flip `invert`, exactly like the views.
 // So the HUD follows invert, and F5 flips a per-session correction if it starts on the wrong window.
-std::atomic<bool> g_hud_flip{false};
+std::atomic<bool> g_hud_flip{LoadCoopView(1)};
+bool BsHudFlipped() { return g_hud_flip.load(); }
 bool BsBdInMain() { return rex::graphics::split_view::state().invert.load() != g_hud_flip.load(); }
-void BsHudFlip() { g_hud_flip = !g_hud_flip.load(); Log("HUD moved to the other window (F5)"); }
+void BsHudFlip() { g_hud_flip = !g_hud_flip.load(); Log("HUD moved to the other window (F5)"); SaveCoopViews(g_label_fix.load(), g_hud_flip.load()); }
 bool BsPadOnP2() { return g_pad_p2.load() && BsCoopSplit(); }
 void BsPadSwap() {
   if (!BsCoopSplit() || !g_p2.load()) { Log("Controller swap: only in co-op split (spawn a Big Daddy first)"); return; }
@@ -747,6 +847,11 @@ void BsP2Blind(bool on) { g_p2_blind = on; }
 void BsP2Squeeze(bool on) { g_p2_squeeze = on; }
 void BsP2AsPlayer(bool on) { g_p2_as_player = on; }
 // HUD: true while a P2 Big Daddy exists; health and max health.
+// Big Daddy action wheel (bd_hud.h draws it): hold D-pad Left on his controller (or Q on the keyboard), aim with
+// the right stick (keyboard: 1-8 while Q is held), release to do it. Slots clockwise from the top:
+// 0 Punch, 1 Charge, 2 Slam, 3 Shove, 4 Jump, 5 Drill, 6 Use, 7 Roar.
+std::atomic<bool> g_bdw_open{false}; std::atomic<int> g_bdw_sel{-1};
+bool BsBdWheel(int* sel) { *sel = g_bdw_sel.load(); return g_bdw_open.load(); }
 bool BsP2HudData(float* hp, float* mx) { *hp = g_hud_hp.load(); *mx = g_hud_max.load(); return g_p2.load() != 0; }
 std::string BsSplitStats() {
   namespace sv = rex::graphics::split_view;
@@ -764,6 +869,8 @@ bool BsPadPollIndex(int i, uint16_t* buttons, int16_t* lx, int16_t* ly, int16_t*
 // Spawn a Big Daddy and put you in control of him (triple F8, or D-pad down x5 on the controller).
 std::atomic<bool> g_p2_keep{false};  // a quick-spawned Big Daddy: bring him back after a reload / Jack's death
 void BsP2QuickSpawn(const char* why) {
+  // One Big Daddy at a time: a second spawn dropped the first back to AI, and it killed Jack (2026-11-03).
+  if (g_p2.load() && g_hud_hp.load() > 0.0f) { Log("P2: you already have a Big Daddy - Back / F6 or F8 to control him"); return; }
   g_p2_keep = true;
   if (g_p2_kbd.load()) BsQueueCommand("viewself"), BsQueueCommand("behindview 0");
   g_p2_kbd = false;
@@ -773,6 +880,20 @@ void BsP2QuickSpawn(const char* why) {
 }
 // D-pad down pressed 5 times within 1.5 s (controller 1) = BsP2QuickSpawn. Polled every frame.
 void BsPollPadSpawnCombo() {
+  // Big Daddy pad join: with no Big Daddy around, A / Start on the dedicated pad spawns one.
+  if (g_bd_pad_join.load() && !g_p2.load() && !g_p2_want.load() && g_player.load()) {
+    static auto s_last = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+    int want = g_bd_pad.load();
+    for (int i = (want >= 1 ? want : 1); i <= (want >= 1 ? want : 3); ++i) {
+      uint16_t jb; int16_t j0, j1, j2, j3; uint8_t jt;
+      if (!BsPadPollIndex(i, &jb, &j0, &j1, &j2, &j3, &jt)) continue;
+      if ((jb & 0x1010) && std::chrono::steady_clock::now() - s_last > std::chrono::seconds(8)) {
+        s_last = std::chrono::steady_clock::now();
+        BsP2QuickSpawn(fmt::format("controller {} joined", i + 1).c_str());
+      }
+      break;
+    }
+  }
   static bool s_prev = false; static std::chrono::steady_clock::time_point s_t[5]{};
   uint16_t b = 0; int16_t a0, a1, a2, a3; uint8_t t;
   bool down = BsPadPollIndex(0, &b, &a0, &a1, &a2, &a3, &t) && (b & 0x0002);
@@ -1135,6 +1256,86 @@ static uint32_t PlaySlot(PPCContext& ctx, uint8_t* base, uint32_t actor, const c
   return g_anim_slot[channel & 3];
 }
 
+// Co-op split, per frame: both windows are frames of Jack's one controller, so his HUD (health/EVE gauges, prompts)
+// and his view state (death zoom FOV) were drawn into the Big Daddy's frames too. On Big Daddy frames: hide Jack's
+// HUD and use the default FOV; on Jack's frames put both back. Knobs: bdhud = 0 off, 1 bHideHUD, 2 DontRenderHud,
+// 3 both (default 0: no effect on the gauges, 11-06 test); bdfov = Big Daddy FOV (default: the controller's DefaultFOV).
+// Bool masks: Xbox 360 bitfields fill from the top bit, and bHideHUD / DontRenderHud are the first bool of their
+// word (HUD +0x460 / ShockHUD +0x918, props dump 2026-11-06), so both are 0x80000000.
+static uint32_t FindClassByName(PPCContext& ctx, uint8_t* base, const std::string& name);
+std::atomic<uint32_t> g_accept_fn{0};   // FlashGUIController.AcceptOrSelect (learned or found)
+std::atomic<bool> g_revive_watch{false}, g_revive_cue{false}, g_revive_done{false};
+std::atomic<bool> g_bd_frame{false};  // this game frame is the Big Daddy's (co-op split)
+static void BsSplitFrameFx(PPCContext& ctx, uint8_t* base, uint32_t pc, bool bd_frame) {
+  auto put = [&](uint32_t a, uint32_t v) { base[a] = uint8_t(v >> 24); base[a + 1] = uint8_t(v >> 16); base[a + 2] = uint8_t(v >> 8); base[a + 3] = uint8_t(v); };
+  static uint32_t s_hud_off = 0, s_tries = 0;
+  static bool s_applied = false;
+  static uint32_t s_hud = 0, s_hide_was = 0, s_dont_was = 0, s_fov_was = 0, s_gui_addr = 0, s_gui_was = 0;
+  static uint32_t s_mk_addr[8] = {}, s_mk_was[8] = {};
+  if (s_applied) {  // undo last Big Daddy frame (always, so turning the knob off or leaving split restores)
+    if (InHeap(s_hud)) { put(s_hud + 0x460, BE32(base, s_hud + 0x460) & ~0x80000000u | s_hide_was);
+                         put(s_hud + 0x918, BE32(base, s_hud + 0x918) & ~0x80000000u | s_dont_was); }
+    if (InHeap(pc)) put(pc + 0x42C, s_fov_was);
+    if (s_gui_addr) { put(s_gui_addr, s_gui_was); s_gui_addr = 0; }
+    for (int i = 7; i >= 0; --i) if (s_mk_addr[i]) { put(s_mk_addr[i], s_mk_was[i]); s_mk_addr[i] = 0; }
+    s_applied = false;
+  }
+  g_bd_frame = bd_frame;
+  if (!bd_frame || !InHeap(pc)) return;
+  if (!s_hud_off && s_tries < 20 && (++s_tries % 4) == 1) { uint32_t m; if (!FindPropOffset(ctx, base, pc, "myHUD", &s_hud_off, &m)) s_hud_off = 0; }
+  const int mode = int(BsKnob("bdhud", 0.0f));  // 0: tested 11-06, neither flag hides the gauges (Scaleform UI, not the HUD canvas)
+  s_hud = s_hud_off ? BE32(base, pc + s_hud_off) : 0;
+  if (!InHeap(s_hud)) s_hud = 0;
+  if (s_hud) {
+    s_hide_was = BE32(base, s_hud + 0x460) & 0x80000000u; s_dont_was = BE32(base, s_hud + 0x918) & 0x80000000u;
+    if (mode & 1) put(s_hud + 0x460, BE32(base, s_hud + 0x460) | 0x80000000u);
+    if (mode & 2) put(s_hud + 0x918, BE32(base, s_hud + 0x918) | 0x80000000u);
+  }
+  // Jack's Scaleform layer (gauges, prompts, popups, death screen) is drawn by the FlashGUIController, an
+  // Interaction hanging off the viewport (Player +0x44). Interactions draw only while bVisible (bools word +0x38,
+  // bActive 0x80000000 / bVisible 0x40000000; probe 11-06). Clear bVisible on Big Daddy frames. Knob bdui=0 turns it off.
+  if (BsKnob("bdui", 1.0f) != 0.0f) {
+    static uint32_t s_po = 0, s_gcls = 0; static int s_t = 0;
+    if ((!s_po || !s_gcls) && s_t < 10 && (++s_t % 3) == 1) {
+      uint32_t m; if (!FindPropOffset(ctx, base, pc, "Player", &s_po, &m)) s_po = 0;
+      s_gcls = FindClassByName(ctx, base, "FlashGUIController");
+      Log(fmt::format("split: Jack's UI layer - Player at +{:X}, FlashGUIController class {:08X}", s_po, s_gcls));
+    }
+    uint32_t player = s_po ? BE32(base, pc + s_po) : 0;
+    uint32_t gui = InHeap(player) ? BE32(base, player + 0x44) : 0;
+    if (s_gcls && InHeap(gui) && BE32(base, gui + 0x2C) == s_gcls) {
+      s_gui_addr = gui + 0x38; s_gui_was = BE32(base, s_gui_addr);
+      put(s_gui_addr, s_gui_was & ~0x40000000u);
+    }
+  }
+  for (int i = 0; i < 8; ++i) {  // run\cmd.txt bdclr/bdset
+    uint32_t a = g_bdmask[i].addr.load(); if (!InHeap(a)) continue;
+    s_mk_addr[i] = a; s_mk_was[i] = BE32(base, a); uint32_t m = g_bdmask[i].mask.load();
+    put(a, g_bdmask[i].set.load() ? (s_mk_was[i] | m) : (s_mk_was[i] & ~m));
+  }
+  s_fov_was = BE32(base, pc + 0x42C);
+  uint32_t dv = BE32(base, pc + 0x61C); float df; std::memcpy(&df, &dv, 4);
+  if (!(df > 30.0f && df < 130.0f)) df = 75.0f;
+  float fov = BsKnob("bdfov", df); uint32_t fv; std::memcpy(&fv, &fov, 4);
+  put(pc + 0x42C, fv);
+  s_applied = true;
+}
+
+// Render-path probe: each of these (draw path below the viewport render, 2026-11-06) can be skipped on Big Daddy
+// frames with knob skN=1, to find the one that draws Jack's Scaleform layer. r3 = 0 when skipped.
+#define BS_SKIP_HOOK(addr, k)                                                                     \
+  extern "C" void __imp__sub_##addr(PPCContext& __restrict ctx, uint8_t* base);                 \
+  extern "C" REX_FUNC(sub_##addr) {                                                              \
+    if (g_bd_frame.load() && BsKnob(k, 0.0f) != 0.0f) { ctx.r3.u64 = 0; return; }               \
+    __imp__sub_##addr(ctx, base);                                                                \
+  }
+BS_SKIP_HOOK(82204130, "sk1")  // InteractionMaster Process_PostRender (script event)
+BS_SKIP_HOOK(82387800, "sk2")  // called just before it
+BS_SKIP_HOOK(82389000, "sk3")
+BS_SKIP_HOOK(822D72A0, "sk4")  // after it
+BS_SKIP_HOOK(82392C30, "sk5")  // early in the same function
+BS_SKIP_HOOK(823BA168, "sk6")  // after the scene render in the viewport draw
+BS_SKIP_HOOK(824738C8, "sk7")
 static void BsCamTick(PPCContext& ctx, uint8_t* base, uint32_t p) {
   auto put = [&](uint32_t a, uint32_t v) { base[a] = uint8_t(v >> 24); base[a + 1] = uint8_t(v >> 16); base[a + 2] = uint8_t(v >> 8); base[a + 3] = uint8_t(v); };
   auto getf = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
@@ -1151,6 +1352,7 @@ static void BsCamTick(PPCContext& ctx, uint8_t* base, uint32_t p) {
   if (m == 1) {
     // Two views, alternate frames: odd = Big Daddy (window 2), even = Jack (window 1).
     bool odd = (++s_frame & 1) != 0;
+    BsSplitFrameFx(ctx, base, pc, odd);
     uint32_t cam = g_cam_actor.load();
     bool cam_ok = InHeap(cam) && BE32(base, cam + 0x2C) == g_cam_class.load();
     static int s_cam_tries = 0;
@@ -1163,7 +1365,11 @@ static void BsCamTick(PPCContext& ctx, uint8_t* base, uint32_t p) {
                             : "split cam: last try - if this fails the P2 view orbits with Jack's look");
     }
     if (odd) {
-      if (g_p2_kbd.load()) s_bd_pitch = std::clamp(s_bd_pitch - BsMouseDY() * 40 + (g_pad_p2.load() ? int(g_pad_pitch / 32767.0f * 300.0f) : 0), -11000, 5000);
+      if (g_p2_kbd.load()) {
+        const bool pad_look = g_pad_p2.load() || g_bd_pad_now.load() >= 0;
+        const int mouse = g_bd_pad_now.load() >= 0 ? 0 : BsMouseDY();  // mouse stays with Jack when a pad drives him
+        s_bd_pitch = std::clamp(s_bd_pitch - mouse * int(BsKnob("bdmouse", 40)) + (pad_look ? int(g_pad_pitch / 32767.0f * BsKnob("bdpadlook", 300.0f)) : 0), -11000, 5000);
+      }
       if (cam_ok) {
         // Orbit camera behind the Big Daddy's head, looking along his facing. Player feel: the position
         // eases toward its target (weighty follow), pulls in during a charge, and shakes on impacts.
@@ -1172,13 +1378,13 @@ static void BsCamTick(PPCContext& ctx, uint8_t* base, uint32_t p) {
         float yr = yaw * k, pr = s_bd_pitch * k;
         float fx = std::cos(pr) * std::cos(yr), fy = std::cos(pr) * std::sin(yr), fz = std::sin(pr);
         static float s_dist = 330.0f;
-        s_dist += ((std::chrono::steady_clock::now() < g_charge_until ? 245.0f : 330.0f) - s_dist) * 0.12f;
-        float tx = getf(p + 0x1C0), ty = getf(p + 0x1C4), tz = getf(p + 0x1C8) + 95.0f;
-        float wx = tx - fx * s_dist, wy = ty - fy * s_dist, wz = tz - fz * s_dist + 25.0f;
+        s_dist += ((std::chrono::steady_clock::now() < g_charge_until ? BsKnob("bdcamcharge", 245.0f) : BsKnob("bdcam", 330.0f)) - s_dist) * 0.12f;
+        float tx = getf(p + 0x1C0), ty = getf(p + 0x1C4), tz = getf(p + 0x1C8) + BsKnob("bdhead", 95.0f);
+        float wx = tx - fx * s_dist, wy = ty - fy * s_dist, wz = tz - fz * s_dist + BsKnob("bdcamz", 25.0f);
         static float s_cx = 0, s_cy = 0, s_cz = 0; static bool s_init = false;
         float jx = wx - s_cx, jy = wy - s_cy, jz = wz - s_cz;
         if (!s_init || jx * jx + jy * jy + jz * jz > 800.0f * 800.0f) { s_cx = wx; s_cy = wy; s_cz = wz; s_init = true; }
-        else { s_cx += jx * 0.35f; s_cy += jy * 0.35f; s_cz += jz * 0.35f; }
+        else { const float fo = BsKnob("bdfollow", 0.35f); s_cx += jx * fo; s_cy += jy * fo; s_cz += jz * fo; }
         static uint32_t s_rng = 12345u;
         auto rnd = [&]() { s_rng = s_rng * 1664525u + 1013904223u; return float(s_rng >> 8) / float(1u << 24) * 2.0f - 1.0f; };
         float sh = g_cam_shake;
@@ -1232,6 +1438,7 @@ static void BsCamTick(PPCContext& ctx, uint8_t* base, uint32_t p) {
     uint32_t vt = BE32(base, pc + 0x5F0);
     if (vt == g_cam_actor.load() && vt) { put(pc + 0x5F0, pl); base[pc + 0x564] &= uint8_t(~0x04); }
   }
+  BsSplitFrameFx(ctx, base, pc, false);  // not split: make sure nothing of the Big Daddy frame stays
   uint32_t w564 = BE32(base, pc + 0x564);
   if (w564 != s_last564) { s_last564 = w564; Log(fmt::format("cam: controller {:08X} +564 = {:08X} viewtarget {:08X}", pc, w564, BE32(base, pc + 0x5F0))); }
   (void)ctx;
@@ -1261,7 +1468,7 @@ static bool GiveItemClass(PPCContext& ctx, uint8_t* base, uint32_t klass, uint32
 }
 // Lists an object's own script properties (name, type, offset, raw value), class chain up to Actor.
 // Used once per pickup class so we can see where the item class / count live.
-static void DumpProps(PPCContext& ctx, uint8_t* base, uint32_t obj, const char* why) {
+static void DumpProps(PPCContext& ctx, uint8_t* base, uint32_t obj, const char* why, int max_lines = 120) {
   uint32_t o0 = 0, m0 = 0;
   FindPropOffset(ctx, base, obj, "Location", &o0, &m0);  // calibrates g_prop_off_field
   if (g_prop_off_field < 0) return;
@@ -1277,10 +1484,114 @@ static void DumpProps(PPCContext& ctx, uint8_t* base, uint32_t obj, const char* 
       uint32_t off = BE32(base, f + g_prop_off_field);
       if (off > 0x4000) continue;
       out += fmt::format("\n    {}.{} {} +{:X} = {:08X}", cn, FNameStr(ctx, base, f, sp), ty, off, BE32(base, obj + off));
-      if (++lines > 120) break;
+      if (++lines > max_lines) break;
     }
   }
   REXLOG_INFO("bioshock-recomp: give: props of {:08X} ({}):{}", obj, why, out);
+}
+
+// Probe (knobs): what does a hit / death on Jack change that leaks into the Big Daddy's view? Jack's controller is
+// the only camera (both views are its frames), so any screen effect it carries shows in both windows.
+//   hurtjack=N  - each new value hits Jack for N damage (TakeSimpleDamage core), then dumps his controller,
+//                 pawn and HUD 250 ms later.   pcdump=K - each new value dumps them now (baseline).
+// Death help popup ("You are being REVIVED at a Vita-Chamber", pauses both players): when Jack's health drops to 0,
+// watch 20 s for the popup (controller input context change), then press its Close for him (AcceptOrSelect on the
+// FlashGUIController) once it is on screen. Knob autorevive=0 turns it off.
+static std::string FnNameCached(PPCContext& ctx, uint8_t* base, uint32_t fn);
+static void BsAutoCloseRevive(PPCContext& ctx, uint8_t* base) {
+  using clk = std::chrono::steady_clock;
+  static float s_hp = 1.0f; static clk::time_point s_dead_t{}, s_close_at{};
+  uint32_t pl = g_player.load(); if (!InHeap(pl)) return;
+  uint32_t v = BE32(base, pl + 1356); float hp; std::memcpy(&hp, &v, 4);
+  if (s_hp > 0.0f && hp <= 0.0f && BsKnob("autorevive", 1.0f) != 0.0f) { s_dead_t = clk::now(); g_revive_cue = false; g_revive_done = false; g_revive_watch = true; Log("ui: Jack died - watching for the revive popup"); }
+  s_hp = hp;
+  if (!g_revive_watch.load()) return;
+  if (clk::now() - s_dead_t > std::chrono::seconds(25)) { g_revive_watch = false; s_close_at = {}; return; }
+  // The popup opens with the death fade still running and ignores Close until it is on screen: press Close after
+  // revivedelay ms (default 1000) and again every 0.7 s until the game pops its input context (it closed).
+  if (g_revive_cue.exchange(false)) { g_revive_done = false; s_close_at = clk::now() + std::chrono::milliseconds(int(BsKnob("revivedelay", 1000.0f))); }
+  if (g_revive_done.load() && s_close_at.time_since_epoch().count()) { s_close_at = {}; g_revive_watch = false; Log("ui: revive popup closed for you"); return; }
+  if (s_close_at.time_since_epoch().count() && clk::now() >= s_close_at) {
+    s_close_at = clk::now() + std::chrono::milliseconds(700);
+    uint32_t pc = BE32(base, pl + 0x420), player = InHeap(pc) ? BE32(base, pc + 0x560) : 0, gui = InHeap(player) ? BE32(base, player + 0x44) : 0;
+    if (!InHeap(gui)) { Log("ui: revive popup - no GUI controller"); return; }
+    if (!g_accept_fn.load()) if (uint32_t f = FindFunction(ctx, base, gui, "AcceptOrSelect")) g_accept_fn = f;
+    if (!g_accept_fn.load()) {
+      // The UFunction sits at the same heap address every launch (45DB0780 in three sessions, 2026-11-06); a pressed
+      // A saves it to run\accept_fn.txt. Use it only after its name checks out.
+      uint32_t cand = 0x45DB0780u;
+      { std::ifstream f("run\\accept_fn.txt"); std::string l; if (std::getline(f, l)) try { cand = uint32_t(std::stoul(l, nullptr, 16)); } catch (...) {} }
+      if (InHeap(cand)) { PPCContext k = ctx; std::string nm = FnNameCached(ctx, base, cand); ctx = k; if (nm == "AcceptOrSelect") g_accept_fn = cand; }
+    }
+    uint32_t fn = g_accept_fn.load();
+    if (!fn) { Log("ui: revive popup - AcceptOrSelect unknown (press A once this session to teach it)"); return; }
+    PPCContext saved = ctx;
+    uint32_t sp = (ctx.r1.u32 - 0x6800) & ~0xFu, parms = sp + 0x400;
+    std::memset(base + parms, 0, 0x100);
+    ctx.r1.u64 = sp; ctx.r3.u64 = gui; ctx.r4.u64 = fn; ctx.r5.u64 = parms;
+    __imp__sub_8247FFB0(ctx, base);
+    ctx = saved;
+    Log("ui: revive popup - pressed Close");
+  }
+}
+static void BsRunDevCmds(PPCContext& ctx, uint8_t* base) {
+  BsAutoCloseRevive(ctx, base);
+  std::vector<std::string> cmds; { std::lock_guard<std::mutex> lk(g_devcmd_mu); cmds.swap(g_devcmds); }
+  for (const std::string& c : cmds) {
+    char op[16] = {}; uint32_t x = 0, y = 0; int n = std::sscanf(c.c_str(), "%15s %x %x", op, &x, &y);
+    std::string o = op;
+    Log("cmd: " + c);
+    auto words = [&](uint32_t a, uint32_t cnt) { std::string r; for (uint32_t i = 0; i < cnt; ++i) { if (i % 8 == 0) r += fmt::format("\n    {:08X}:", a + 4 * i); r += fmt::format(" {:08X}", BE32(base, a + 4 * i)); } return r; };
+    if (o == "peek" && n >= 2 && HeapOrImg(x)) Log("peek" + words(x & ~3u, n >= 3 ? std::min(y, 256u) : 16));
+    else if (o == "poke" && n == 3 && InHeap(x)) { base[x] = uint8_t(y >> 24); base[x + 1] = uint8_t(y >> 16); base[x + 2] = uint8_t(y >> 8); base[x + 3] = uint8_t(y); }
+    else if ((o == "bdclr" || o == "bdset") && n == 3 && InHeap(x)) {
+      for (auto& m : g_bdmask) if (!m.addr.load()) { m.mask = y; m.set = o == "bdset"; m.addr = x & ~3u; break; }
+    } else if (o == "bdoff") { for (auto& m : g_bdmask) m.addr = 0; }
+    else if (o == "ev" && n >= 2 && InHeap(x)) { for (auto& w : g_evwatch) if (!w.load()) { w = x; break; } }
+    else if (o == "evoff") { for (auto& w : g_evwatch) w = 0; }
+    else if (o == "dumpobj" && n >= 2 && InHeap(x)) {
+      uint32_t sp = (ctx.r1.u32 - 0x5000) & ~0xFu; std::string ch;
+      for (uint32_t k = BE32(base, x + 0x2C), q = 0; k && HeapOrImg(k) && q < 10; k = BE32(base, k + 0x38), ++q) { PPCContext sv = ctx; ch += ClassNameCached(ctx, base, k, sp) + ">"; ctx = sv; }
+      Log(fmt::format("dumpobj {:08X} {}", x, ch) + words(x, 0xC0));
+    } else if (o == "jackui") {
+      uint32_t pl = g_player.load(), pc = InHeap(pl) ? BE32(base, pl + 0x420) : 0;
+      uint32_t player = InHeap(pc) ? BE32(base, pc + 0x560) : 0, gui = InHeap(player) ? BE32(base, player + 0x44) : 0;
+      Log(fmt::format("jackui: pc {:08X} player {:08X} gui {:08X} gui+38 {:08X}", pc, player, gui, InHeap(gui) ? BE32(base, gui + 0x38) : 0));
+      if (InHeap(gui)) { uint32_t vt = BE32(base, gui); Log(fmt::format("jackui: gui vtable {:08X}", vt) + (HeapOrImg(vt) ? words(vt, 96) : std::string())); Log("jackui: gui" + words(gui, 0x60)); }
+      if (InHeap(player)) Log("jackui: player" + words(player, 0x60));
+    } else if (o == "con" && c.size() > 4) BsQueueCommand(c.substr(4));
+    else if (o == "block" && c.size() > 6) { { std::ofstream f("run\\uiblock.txt", std::ios::app); f << c.substr(6) << "\n"; } BsLoadUiBlock(); Log("ui: blocking '" + c.substr(6) + "'"); }
+  }
+}
+static void BsProbeJack(PPCContext& ctx, uint8_t* base) {
+  static float s_hurt = 0.0f, s_dump = 0.0f;
+  static auto s_dump_at = std::chrono::steady_clock::time_point{};
+  uint32_t pl = g_player.load();
+  if (!InHeap(pl)) return;
+  uint32_t pc = BE32(base, pl + 0x420);
+  auto dump = [&](const char* tag) {
+    if (InHeap(pc)) DumpProps(ctx, base, pc, tag, 600);
+    DumpProps(ctx, base, pl, tag, 600);
+    uint32_t ho = 0, hm = 0;
+    if (InHeap(pc) && FindPropOffset(ctx, base, pc, "myHUD", &ho, &hm) && InHeap(BE32(base, pc + ho))) DumpProps(ctx, base, BE32(base, pc + ho), tag, 600);
+  };
+  const float h = BsKnob("hurtjack", 0.0f), d = BsKnob("pcdump", 0.0f);
+  if (d != s_dump) { s_dump = d; if (d > 0.0f) dump("pcdump baseline"); }
+  if (h != s_hurt) {
+    s_hurt = h;
+    if (h > 0.0f) {
+      PPCContext saved = ctx;
+      uint32_t sp = (ctx.r1.u32 - 0x5800) & ~0xFu;
+      std::memset(base + sp + 0x1400, 0, 8);  // FName None
+      ctx.r1.u64 = sp; ctx.r3.u64 = pl; ctx.r4.u64 = 17; ctx.f1.f64 = h; ctx.f2.f64 = 1.0;
+      ctx.r5.u64 = 0; ctx.r6.u64 = 0; ctx.r7.u64 = 0; ctx.r8.u64 = sp + 0x1400;
+      __imp__sub_8250EFB0(ctx, base);
+      ctx = saved;
+      Log(fmt::format("probe: hurt Jack for {:.0f}", h));
+      s_dump_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+    }
+  }
+  if (s_dump_at.time_since_epoch().count() && std::chrono::steady_clock::now() >= s_dump_at) { s_dump_at = {}; dump("pcdump after hit"); }
 }
 
 // Class lookup by bare name in any package (FindObject<UClass>(ANY_PACKAGE, Name)). 0 if none.
@@ -1693,6 +2004,12 @@ struct OurTickTimer {
   std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
   ~OurTickTimer() { g_our_tick_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
 };
+// True once the pawn has existed for 2 s (its init still uses the AI controller before that).
+static bool settled_for_input(uint32_t p) {
+  static uint32_t s_p = 0; static auto s_t0 = std::chrono::steady_clock::now();
+  if (s_p != p) { s_p = p; s_t0 = std::chrono::steady_clock::now(); }
+  return std::chrono::steady_clock::now() - s_t0 > std::chrono::seconds(2);
+}
 void BsTickP2(PPCContext& ctx, uint8_t* base) {
   {
     static auto s_prev = std::chrono::steady_clock::now();
@@ -1757,7 +2074,28 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
   }
   BsCamTick(ctx, base, p);  // camera runs even with the panel open (split view keeps routing)
   if (g_panel_open.load()) return;  // panel open: no P2 input (world is frozen anyway)
-  if (g_p2_kbd.load()) {
+  // Dedicated Big Daddy pad (resolved once per tick): fixed index, or auto = first pad other than 0.
+  int bd_pad = -1;
+  {
+    uint16_t qb; int16_t q0, q1, q2, q3; uint8_t qt;
+    int want = g_bd_pad.load();
+    if (want >= 1 && want <= 3) { if (BsPadPollIndex(want, &qb, &q0, &q1, &q2, &q3, &qt)) bd_pad = want; }
+    else for (int i = 1; i <= 3 && bd_pad < 0; ++i) if (BsPadPollIndex(i, &qb, &q0, &q1, &q2, &q3, &qt)) bd_pad = i;
+    static int s_prev_pad = -2;
+    if (bd_pad != s_prev_pad) {
+      if (bd_pad >= 0) Log(fmt::format("P2: controller {} drives the Big Daddy (keyboard + mouse stay with Jack)", bd_pad + 1));
+      else if (s_prev_pad >= 0) Log("P2: Big Daddy controller disconnected - keyboard + mouse drive him");
+      s_prev_pad = bd_pad;
+    }
+    g_bd_pad_now = bd_pad;
+    if (bd_pad >= 0 && !g_p2_kbd.load() && settled_for_input(p)) {
+      // A pad joined: he goes into driven mode by itself (camera, squeeze, AI off).
+      g_p2_kbd = true; BsQueueCommand("viewclass " + g_p2_view); BsQueueCommand("behindview 1");
+      if (g_split_default.load() && !BsCoopSplit()) BsSplitWindow(true);
+      Log("P2: driven by the Big Daddy controller");
+    }
+  }
+  if (g_p2_kbd.load() && bd_pad < 0) {
     ly = int16_t((BsKeyDown('W') ? 32767 : 0) - (BsKeyDown('S') ? 32767 : 0));
     lx = int16_t((BsKeyDown('D') ? 32767 : 0) - (BsKeyDown('A') ? 32767 : 0));
     int turn = (BsKeyDown(0x27) ? 1 : 0) - (BsKeyDown(0x25) ? 1 : 0);  // arrows; E is now Use
@@ -1786,19 +2124,46 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
       charge_btn = charge_btn || (pb & 0x0008);  // D-pad right
       b |= pb;
     }
-  } else if (BsPadPollIndex(1, &b, &lx, &ly, &rx, &ry, &rt)) {
+  } else if (bd_pad >= 0 && BsPadPollIndex(bd_pad, &b, &lx, &ly, &rx, &ry, &rt)) {
+    // Dedicated pad: same layout as pad 0 when swapped. RT punch, LT/LB/RB drill, A jump, B slam,
+    // X use, Y shove, D-pad up roar, D-pad right charge, L3 run, right stick look.
+    g_pad_pitch = ry;
     attack = rt > 100;
-    drill = (b & 0x0300) != 0 || BsPadLT(1) > 60;
-    use = (b & 0x4000) != 0;  // X
-    shove = (b & 0x8000) != 0;  // Y
-    roar = (b & 0x0001) != 0;   // D-pad up
-    charge_btn = (b & 0x0008) != 0;  // D-pad right
+    drill = (b & 0x0300) != 0 || BsPadLT(bd_pad) > 60;
+    use = (b & 0x4000) != 0;
+    shove = (b & 0x8000) != 0;
+    roar = (b & 0x0001) != 0;
+    charge_btn = (b & 0x0008) != 0;
     jump = (b & 0x1000) != 0;
     slam_btn = (b & 0x2000) != 0;
   } else {
     lx = ly = rx = ry = 0;  // no input device: camera only, leave the AI alone
   }
-  bool driving = g_p2_kbd.load() || BsPadPollIndex(1, &b, &lx, &ly, &rx, &ry, &rt);
+  { // Big Daddy action wheel
+    static bool s_open = false; static int s_sel = -1; static int s_act = -1;
+    static std::chrono::steady_clock::time_point s_until{};
+    const bool kb = g_p2_kbd.load() && bd_pad < 0;
+    const bool held = (b & 0x0004) != 0 || (kb && BsKeyDown('Q'));   // D-pad Left / Q
+    if (held) {
+      if (!s_open) { s_open = true; s_sel = -1; }
+      const float x = rx / 32767.0f, y = ry / 32767.0f;
+      if (!kb && x * x + y * y > 0.35f) { float a = std::atan2(x, y); if (a < 0) a += 6.2831853f; s_sel = int(std::floor((a + 0.3926991f) / 0.7853982f)) % 8; }
+      if (kb) for (int i = 0; i < 8; ++i) if (BsKeyDown('1' + i)) s_sel = i;
+      rx = ry = 0; g_pad_pitch = 0;   // the stick aims the wheel, not the camera
+      attack = drill = jump = slam_btn = use = shove = roar = charge_btn = false;
+    } else if (s_open) {
+      s_open = false;
+      if (s_sel >= 0) { s_act = s_sel; s_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(s_sel == 5 ? 1500 : 150);
+        static const char* kNames[8] = {"punch", "charge", "slam", "shove", "jump", "drill", "use", "roar"};
+        Log(fmt::format("P2: wheel -> {}", kNames[s_sel])); }
+    }
+    if (s_act >= 0 && std::chrono::steady_clock::now() < s_until) {
+      switch (s_act) { case 0: attack = true; break; case 1: charge_btn = true; break; case 2: slam_btn = true; break; case 3: shove = true; break;
+                       case 4: jump = true; break; case 5: drill = true; break; case 6: use = true; break; case 7: roar = true; break; }
+    } else s_act = -1;
+    g_bdw_open = s_open; g_bdw_sel = s_sel;
+  }
+  bool driving = g_p2_kbd.load() || bd_pad >= 0;
   auto put = [&](uint32_t a, uint32_t v) { base[a] = uint8_t(v >> 24); base[a + 1] = uint8_t(v >> 16); base[a + 2] = uint8_t(v >> 8); base[a + 3] = uint8_t(v); };
   auto putf = [&](uint32_t a, float f) { uint32_t v; std::memcpy(&v, &f, 4); put(a, v); };
   auto getf = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
@@ -1880,7 +2245,7 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
   // Move: XLevel->MoveActor(actor, Delta, Rotation, Hit, ...) = ULevel vtable+288, the same call
   // AActor::execMove (0x822F7BA0) makes. Handles collision; see the step-up logic below.
   // Big Daddy pace: heavy walk ~210 u/s, lumbering run ~390 u/s (Shift / L3).
-  const float kStep = (g_p2_kbd.load() && BsKeyDown(0x10)) || (b & 0x0040) ? 6.5f : 3.5f;
+  const float kStep = (g_p2_kbd.load() && BsKeyDown(0x10)) || (b & 0x0040) ? BsKnob("bdrun", 5.5f) : BsKnob("bdwalk", 3.0f);
   float dx = (cx * fwd - cy * side) * kStep, dy = (cy * fwd + cx * side) * kStep;
   uint32_t level = BE32(base, p + 228);
   if (InHeap(level) && (fwd != 0.0f || side != 0.0f)) {
@@ -1942,8 +2307,14 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
               s_door_t[hit_actor] = now;
               // The door's own open functions (seen on Jack's doors: WelcomeDoors.OpenIfPossible / Unlock /
               // Open / OpenAndHold, ScriptableMover.DoOpen). Try them as the Big Daddy first.
+              // A door leaf (DoorModel) has no open functions; its Owner (the door) does.
+              uint32_t door = hit_actor;
+              if (chain.rfind("DoorModel<", 0) == 0) {
+                uint32_t oo = 0, om = 0;
+                if (FindPropOffset(ctx, base, hit_actor, "Owner", &oo, &om) && InHeap(BE32(base, hit_actor + oo))) door = BE32(base, hit_actor + oo);
+              }
               for (const char* fnm : {"OpenIfPossible", "DoOpen", "Open"}) {
-                if (CallEvent(ctx, base, hit_actor, fnm, {}, true)) {
+                if (CallEvent(ctx, base, door, fnm, {}, true)) {
                   static int s_dl = 0;
                   if (++s_dl <= 6) Log(fmt::format("P2 move: door {}.{}() called", chain.substr(0, chain.find('<')), fnm));
                   break;
@@ -2265,7 +2636,7 @@ void BsTickP2(PPCContext& ctx, uint8_t* base) {
     std::string assist;
     if (res.empty()) {
       const bool is_slam = s_pending_slot == 0x1288;
-      if (uint32_t o = AssistHit(ctx, base, p, cx, cy, is_slam ? 195.0f : 170.0f, is_slam ? 0.2f : 0.5f, is_slam ? 90.0 : 60.0,
+      if (uint32_t o = AssistHit(ctx, base, p, cx, cy, is_slam ? 195.0f : 120.0f, is_slam ? 0.2f : 0.5f, is_slam ? 90.0 : 60.0,
                                  is_slam ? 500.0f : 0.0f, 0, 0.0f))
         assist = fmt::format(" | assist hit {:08X}", o);
     }
@@ -2503,7 +2874,7 @@ extern "C" REX_FUNC(sub_822F8B80) {
     if (uint32_t sp_ = ctx.r3.u32) {
       g_p2_class = BE32(base, sp_ + 0x2C); g_p2 = sp_;
       Log(fmt::format("P2: controlling pawn {:08X} (second controller)", sp_));
-      g_hud_flip = false; rex::graphics::split_view::state().invert = false;  // window 2 + HUD = Big Daddy
+      g_hud_flip = LoadCoopView(1); rex::graphics::split_view::state().invert = false;  // window 2 + HUD = Big Daddy (F5 choice remembered)
     } else {
       Log("P2: the Big Daddy spawn failed (no room?) - try again somewhere more open");
     }
@@ -2841,6 +3212,53 @@ static void WorldWatchNote(PPCContext& ctx, uint8_t* base) {
 // This is where Jack's pickup of an audio diary should show up.
 extern "C" REX_FUNC(sub_8247FFB0) {
   uint32_t self = ctx.r3.u32, n = g_watch_n.load();
+  // Your Big Daddy turned hostile by himself (BecomeHostileTowardsPlayer from the forced-enemy code while
+  // driven, 2026-11-03) and killed Jack once he was back on AI. While you drive, that event is dropped.
+  if (self && self == g_p2.load() && BsP2KeyboardActive()) {
+    PPCContext k = ctx;
+    std::string fn = FnNameCached(ctx, base, k.r4.u32);
+    ctx = k;
+    if (fn == "BecomeHostileTowardsPlayer") {
+      if (InHeap(self)) base[self + 0x1070] = 2;  // DispositionToPlayer = friendly
+      static int s_n = 0;
+      if (++s_n <= 5) Log("P2: the game tried to turn your Big Daddy hostile - blocked");
+      return;
+    }
+  }
+  {
+    // Jack's Scaleform UI (FlashGUIController): log its console commands (drop the ones in run\uiblock.txt) and
+    // learn AcceptOrSelect, the "A / Close" action the death popup auto-close sends (BsAutoCloseRevive).
+    static uint32_t s_gui_cls = 0, s_cc_fn = 0;
+    uint32_t cls = self && InHeap(self) ? BE32(base, self + 0x2C) : 0;
+    if (cls && (cls == s_gui_cls || !s_gui_cls)) {
+      PPCContext k = ctx;
+      if (!s_gui_cls) { uint32_t sp = (k.r1.u32 - 0x5000) & ~0xFu; if (ClassNameCached(ctx, base, cls, sp) == "FlashGUIController") s_gui_cls = cls; ctx = k; }
+      if (cls == s_gui_cls) {
+        if (!s_cc_fn || !g_accept_fn.load()) {
+          std::string nm = FnNameCached(ctx, base, k.r4.u32); ctx = k;
+          if (nm == "ConsoleCommand") s_cc_fn = k.r4.u32;
+          if (nm == "AcceptOrSelect" && !g_accept_fn.load()) { g_accept_fn = k.r4.u32; Log(fmt::format("ui: learned AcceptOrSelect {:08X}", k.r4.u32)); std::ofstream f("run\\accept_fn.txt"); f << fmt::format("{:08X}\n", k.r4.u32); }
+        }
+        if (k.r4.u32 == s_cc_fn && k.r5.u32 >= 0x10000) {
+          uint32_t d = BE32(base, k.r5.u32), n = BE32(base, k.r5.u32 + 4);
+          std::string str; for (uint32_t i = 0; d >= 0x10000 && i < n && i < 300; ++i) { uint8_t ch = base[d + 2 * i + 1]; if (!ch) break; str += char(ch); }
+          bool blk = BsUiBlocked(str);
+          if (str == "PUSHINPUTCONTEXT WarningUIActive" && g_revive_watch.load()) g_revive_cue = true;   // death popup opened
+          if (str == "POPINPUTCONTEXT WarningUIActive") g_revive_done = true;                             // ...and closed
+          REXLOG_INFO("bioshock-recomp: ui cmd: '{}'{}", str, blk ? " - BLOCKED" : "");
+          if (blk) return;
+        }
+      }
+    }
+  }
+  if (self && (self == g_evwatch[0].load() || self == g_evwatch[1].load() || self == g_evwatch[2].load() || self == g_evwatch[3].load())) {
+    PPCContext k = ctx;
+    std::string fn = FnNameCached(ctx, base, k.r4.u32);
+    ctx = k;
+    static std::mutex mu; static std::unordered_map<std::string, int> seen;
+    int c; { std::lock_guard<std::mutex> lk(mu); c = ++seen[fmt::format("{:08X}.{}", self, fn)]; }
+    if (c <= 3) REXLOG_INFO("bioshock-recomp: event: watched {:08X}.{} (fn {:08X}) #{} | stack {}", self, fn, k.r4.u32, c, GuestBacktrace(base, k));
+  }
   if (self && (n || g_p2.load())) {
     bool hit = self == g_player.load() || self == g_p2.load();
     for (uint32_t i = 0; i < n && !hit; ++i) hit = g_watch[i].load() == self;

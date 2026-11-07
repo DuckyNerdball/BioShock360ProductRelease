@@ -11,6 +11,7 @@
 #include <cfloat>
 #include <cstdio>
 #include <atomic>
+#include <cmath>
 
 // Written on the UI thread by the main window's HUD each ImGui frame. The input thread must read this
 // instead of calling drawer->GetIO(): GetIO() switches the process-global ImGui context, and with two
@@ -22,7 +23,9 @@ bool BsCoopSplit();
 bool BsSplitInverted();
 bool BsP2KeyboardActive();
 bool BsPadOnP2();
+int BsBdPadNow();  // give.cpp: dedicated Big Daddy controller index, -1 none
 bool BsBdInMain();  // give.cpp: Back/F6 put the Big Daddy view in the main window
+bool BsBdWheel(int* sel);  // give.cpp: action wheel open? (+ highlighted slot)
 
 class BigDaddyHud : public rex::ui::ImGuiDialog {
  public:
@@ -59,8 +62,10 @@ class BigDaddyHud : public rex::ui::ImGuiDialog {
     std::snprintf(buf, sizeof(buf), "BIG DADDY   %d / %d", int(hp + 0.5f), int(mx + 0.5f));
     dl->AddText(font, ts, ImVec2(x0 + 1, y0 - ts - 5), IM_COL32(0, 0, 0, 200), buf);
     dl->AddText(font, ts, ImVec2(x0, y0 - ts - 6), IM_COL32(235, 215, 170, 255), buf);
-    const char* who = BsPadOnP2() ? "controller" : "keyboard + mouse";
-    std::snprintf(buf, sizeof(buf), "%s  |  Back / F6: swap control  |  views on the wrong windows? F7", who);
+    char who[40];
+    if (BsBdPadNow() >= 0) std::snprintf(who, sizeof(who), "controller %d", BsBdPadNow() + 1);
+    else std::snprintf(who, sizeof(who), "%s", BsPadOnP2() ? "controller" : "keyboard + mouse");
+    std::snprintf(buf, sizeof(buf), "%s  |  hold D-pad Left / Q: action wheel  |  Back / F6: swap control  |  wrong windows? F7", who);
     dl->AddText(font, ts * 0.6f, ImVec2(x0, y0 + bh + 8), IM_COL32(200, 185, 150, 200), buf);
 
     // Hit flash: red border that fades out.
@@ -72,6 +77,27 @@ class BigDaddyHud : public rex::ui::ImGuiDialog {
       dl->AddRectFilled(ImVec2(0, H - t), ImVec2(W, H), c);
       dl->AddRectFilled(ImVec2(0, 0), ImVec2(t, H), c);
       dl->AddRectFilled(ImVec2(W - t, 0), ImVec2(W, H), c);
+    }
+
+    // Action wheel (hold D-pad Left / Q): 8 attacks, clockwise from the top.
+    int sel = -1;
+    if (BsBdWheel(&sel)) {
+      static const char* kSlots[8] = {"PUNCH", "CHARGE", "SLAM", "SHOVE", "JUMP", "DRILL", "USE", "ROAR"};
+      const ImVec2 c(W * 0.5f, H * 0.5f); const float R = std::min(W, H) * 0.28f;
+      dl->AddCircleFilled(c, R * 1.2f, IM_COL32(20, 14, 8, 175), 64);
+      dl->AddCircle(c, R * 1.2f, IM_COL32(170, 130, 60, 230), 64, 3.0f);
+      for (int i = 0; i < 8; ++i) {
+        const float a = i * 0.7853982f; const ImVec2 p(c.x + std::sin(a) * R * 0.85f, c.y - std::cos(a) * R * 0.85f);
+        if (i == sel) dl->AddCircleFilled(p, R * 0.24f, IM_COL32(230, 165, 40, 170), 40);
+        dl->AddCircle(p, R * 0.24f, IM_COL32(170, 130, 60, 220), 40, 2.0f);
+        const ImVec2 sz = font->CalcTextSizeA(ts, FLT_MAX, 0.0f, kSlots[i]);
+        dl->AddText(font, ts, ImVec2(p.x - sz.x * 0.5f, p.y - sz.y * 0.5f), IM_COL32(235, 215, 170, 255), kSlots[i]);
+        char k[4]; std::snprintf(k, sizeof k, "%d", i + 1);
+        dl->AddText(font, ts * 0.6f, ImVec2(p.x - ts * 0.15f, p.y + sz.y * 0.6f), IM_COL32(170, 130, 60, 200), k);
+      }
+      const char* mid = sel >= 0 ? kSlots[sel] : "release to cancel";
+      const ImVec2 ms = font->CalcTextSizeA(ts * 1.1f, FLT_MAX, 0.0f, mid);
+      dl->AddText(font, ts * 1.1f, ImVec2(c.x - ms.x * 0.5f, c.y - ms.y * 0.5f), IM_COL32(255, 235, 190, 255), mid);
     }
 
     // Down.
