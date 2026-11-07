@@ -77,7 +77,9 @@ function Get-PlayArgs {
 function Start-Console([string]$cmd, [switch]$Keep) {
     $flags = @("-NoProfile", "-ExecutionPolicy", "Bypass")
     if ($Keep) { $flags += "-NoExit" }
-    Start-Process powershell -WorkingDirectory $Root -ArgumentList ($flags + @("-Command", $cmd))
+    # Errors stay on screen instead of the window vanishing.
+    $wrapped = "try { `$ErrorActionPreference = 'Stop'; $cmd } catch { Write-Host `$_ -ForegroundColor Red; Read-Host 'Press Enter to close' }"
+    Start-Process powershell -WorkingDirectory $Root -ArgumentList ($flags + @("-Command", $wrapped))
 }
 
 $btnPlay = New-Ctl Windows.Forms.Button 16 206 140 38 "Play"

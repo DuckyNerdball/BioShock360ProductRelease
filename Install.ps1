@@ -43,6 +43,11 @@ if (-not $admin) {
 }
 Set-Location $Root
 $t0 = Get-Date
+$InstallLog = Join-Path $Root ("logs\install_{0}.log" -f (Get-Date -Format yyyyMMdd_HHmmss))
+New-Item -ItemType Directory (Split-Path $InstallLog) -Force | Out-Null
+try { Start-Transcript -Path $InstallLog -Force | Out-Null } catch {}
+# Any uncaught error (setup.ps1, cmake, git) stops here with a message instead of closing the window.
+trap { Die "Unexpected error: $($_.Exception.Message)`n  Full log: $InstallLog`n  Re-run Install.ps1 after fixing it: finished steps are skipped." }
 
 Step "1. Build tools"
 if ($SkipPrereqs) { Ok "skipped (-SkipPrereqs)" }
