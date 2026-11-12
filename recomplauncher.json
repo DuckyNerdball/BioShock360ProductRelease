@@ -5,7 +5,7 @@
   "repo": "DuckyNerdball/BioShock360ProductRelease",
   "game": {
     "kind": "folder",
-    "label": "The folder extracted from your own BioShock (Xbox 360) disc 1, the one with default.xex. Only the build with title ID 545407D8 and default.xex SHA-1 1be6a0fadea96b3825e6213a4a4ae1a0e4c96c91 is supported.",
+    "label": "The folder extracted from your own BioShock (Xbox 360) disc 1 image, the one with default.xex. To make it: run tools\\extract_disc.ps1 from this project and pick your .iso, or use extract-xiso yourself (extract-xiso -d C:\\Games\\BioShock360 BioShock.iso). Only the build with title ID 545407D8 is supported (default.xex SHA-1 1be6a0fadea96b3825e6213a4a4ae1a0e4c96c91).",
     "check": {
       "file": "default.xex"
     }

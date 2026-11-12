@@ -1,6 +1,7 @@
 #Requires -Version 5.1
 # BioShock 360 Recomp launcher (Windows Forms; no extra installs). Open with BioShock.cmd or the desktop shortcut.
 # Settings are remembered in run\launcher.json. Every button just calls the scripts in tools\.
+# First run: Play is "Set up game": it asks for your BioShock .iso and runs Install.ps1 with it.
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [Windows.Forms.Application]::EnableVisualStyles()
@@ -17,7 +18,7 @@ $LookInfo = @{
     Cinematic = "Original depth-of-field and bloom, 3x."
 }
 
-$s = @{ Look = "Pure"; Fps = "60"; Exposure = ""; Gamma = ""; Scale = "Look default" }
+$s = @{ Look = "Pure"; Fps = "60"; Exposure = ""; Gamma = ""; Scale = "Look default"; Ultrawide = $false }
 if (Test-Path $Cfg) { try { (Get-Content $Cfg -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $s[$_.Name] = $_.Value } } catch {} }
 
 function New-Ctl($type, $x, $y, $w, $h, $text) {
@@ -47,6 +48,8 @@ New-Ctl Windows.Forms.Label 16 136 90 22 "Resolution" | Out-Null
 $cbScale = New-Ctl Windows.Forms.ComboBox 110 134 140 24 $null; $cbScale.DropDownStyle = "DropDownList"
 @("Look default", "1 (720p)", "2 (1440p)", "3 (2160p)", "4 (2880p)") | ForEach-Object { [void]$cbScale.Items.Add($_) }
 $cbScale.SelectedItem = $(if ($cbScale.Items.Contains($s.Scale)) { $s.Scale } else { "Look default" })
+$chkWide = New-Ctl Windows.Forms.CheckBox 262 134 190 24 "Ultrawide (21:9)"
+$chkWide.Checked = [bool]$s.Ultrawide
 
 New-Ctl Windows.Forms.Label 16 168 90 22 "Brightness" | Out-Null
 $tbExp = New-Ctl Windows.Forms.TextBox 110 166 60 24 $s.Exposure
@@ -55,13 +58,41 @@ $tbGam = New-Ctl Windows.Forms.TextBox 236 166 60 24 $s.Gamma
 $lbHint = New-Ctl Windows.Forms.Label 304 168 150 22 "blank = look default"; $lbHint.ForeColor = $lbInfo.ForeColor
 
 $status = New-Ctl Windows.Forms.Label 16 296 430 22 ""
-function Set-Status { if (Test-Path $Exe) { $status.Text = "Ready." ; $status.ForeColor = [Drawing.Color]::FromArgb(120, 220, 140) }
-                      else { $status.Text = "Not built yet: run Install.ps1 (or Build + Play)."; $status.ForeColor = [Drawing.Color]::Orange } }
+$script:SettingUp = $false
+function Set-Status {
+    if (Test-Path $Exe) {
+        $script:SettingUp = $false
+        $status.Text = "Ready."; $status.ForeColor = [Drawing.Color]::FromArgb(120, 220, 140)
+        if ($btnPlay) { $btnPlay.Text = "Play" }
+    } else {
+        $status.ForeColor = [Drawing.Color]::Orange
+        $status.Text = $(if ($script:SettingUp) { "Setting up in the other window (1-2 hours the first time)..." } else { "Not set up yet. Press the green button and pick your BioShock .iso." })
+        if ($btnPlay) { $btnPlay.Text = "Set up game" }   # short: the button is 140 px wide
+    }
+}
 Set-Status
+
+# First-run setup: ask for the player's own disc image, then hand it to Install.ps1 (which installs the build tools,
+# extracts the disc, checks it is the supported build and compiles the game). Install.ps1 asks for admin itself.
+function Start-Setup {
+    $dlg = New-Object Windows.Forms.OpenFileDialog
+    $dlg.Title = "Pick your BioShock (Xbox 360) disc 1 image"
+    $dlg.Filter = "Xbox 360 disc image (*.iso)|*.iso"
+    if ($dlg.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { return }
+    $iso = $dlg.FileName
+    $msg = "Set up BioShock from:`n$iso`n`nThis installs the build tools, extracts your disc and compiles the game on this PC.`nFirst time: 1-2 hours, about 60 GB free, and Windows will ask for administrator rights.`n`nStart now?"
+    $ans = [Windows.Forms.MessageBox]::Show($msg, "BioShock Recomp", [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Question)
+    if ($ans -ne [Windows.Forms.DialogResult]::Yes) { return }
+    $install = Join-Path $Root "Install.ps1"
+    Start-Process powershell -WorkingDirectory $Root -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$install`"", "-Iso", "`"$iso`"")
+    $script:SettingUp = $true
+    Set-Status
+}
 
 function Save-Settings {
     $s.Look = $cbLook.SelectedItem; $s.Fps = $(if ($cbFps.SelectedIndex -eq 1) { "30" } else { "60" })
     $s.Scale = $cbScale.SelectedItem; $s.Exposure = $tbExp.Text.Trim(); $s.Gamma = $tbGam.Text.Trim()
+    $s.Ultrawide = $chkWide.Checked
     New-Item -ItemType Directory (Split-Path $Cfg) -Force | Out-Null
     $s | ConvertTo-Json | Set-Content $Cfg
 }
@@ -69,6 +100,7 @@ function Get-PlayArgs {
     $a = "-Look $($s.Look)"
     if ($s.Fps -eq "30") { $a += " -Fps30" }
     if ($s.Scale -match "^(\d)") { $a += " -Scale $($Matches[1])" }
+    if ($s.Ultrawide) { $a += " -Ultrawide" }
     $d = 0.0
     if ($s.Exposure -and [double]::TryParse($s.Exposure, [ref]$d)) { $a += " -Exposure $d" }
     if ($s.Gamma -and [double]::TryParse($s.Gamma, [ref]$d)) { $a += " -Gamma $d" }
@@ -86,7 +118,7 @@ $btnPlay = New-Ctl Windows.Forms.Button 16 206 140 38 "Play"
 $btnPlay.Font = New-Object Drawing.Font("Segoe UI Semibold", 11); $btnPlay.BackColor = [Drawing.Color]::FromArgb(40, 120, 60)
 $btnPlay.Add_Click({
     Save-Settings
-    if (-not (Test-Path $Exe)) { [Windows.Forms.MessageBox]::Show("bioshock.exe isn't built yet. Run Install.ps1 first.", "BioShock Recomp") | Out-Null; return }
+    if (-not (Test-Path $Exe)) { Start-Setup; return }
     Start-Console "& '.\tools\play.ps1' $(Get-PlayArgs)"
 })
 $btnBuild = New-Ctl Windows.Forms.Button 164 206 140 38 "Build + Play"
@@ -103,5 +135,8 @@ foreach ($b in @($btnBuild, $btnReport, $btnLogs, $btnFix, $btnHelp)) { $b.BackC
 foreach ($b in @($btnPlay, $btnBuild, $btnReport, $btnLogs, $btnFix, $btnHelp)) { $b.FlatStyle = "Flat"; $b.FlatAppearance.BorderColor = [Drawing.Color]::FromArgb(70, 110, 85) }
 foreach ($c in @($cbLook, $cbFps, $cbScale, $tbExp, $tbGam)) { $c.BackColor = [Drawing.Color]::FromArgb(30, 44, 38); $c.ForeColor = $form.ForeColor }
 
-$form.Add_FormClosing({ Save-Settings })
+Set-Status   # now that the Play button exists: it reads "Set up from my disc" until the game is built
+$timer = New-Object Windows.Forms.Timer; $timer.Interval = 3000
+$timer.Add_Tick({ Set-Status }); $timer.Start()   # notices when setup finishes in the other window
+$form.Add_FormClosing({ $timer.Stop(); Save-Settings })
 [void]$form.ShowDialog()

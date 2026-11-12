@@ -51,6 +51,17 @@ This project publishes no built game, so RecompLauncher cannot download one. Aft
 with `Install.ps1`, run `tools\package_local.ps1` and add the folder it makes with RecompLauncher's
 Settings > Developers > Developer tools > "Add a build". That folder contains code generated from your disc: keep it on your PC.
 
+RecompLauncher asks for your copy as a **game folder**: the files extracted from your disc image, with `default.xex`
+at the top. If you ran `Install.ps1` that folder already exists as `game_base1`. To make one from your `.iso` on its own:
+
+```powershell
+.\tools\extract_disc.ps1                                             # asks for the .iso, extracts to .\game_base1
+.\tools\extract_disc.ps1 -Iso D:\BioShock.iso -Out D:\Games\BioShock360   # or choose both
+```
+
+It downloads the open-source `extract-xiso`, extracts the disc (about 2 GB) and checks it is the supported build.
+By hand, the same thing is `extract-xiso -d <folder> <your.iso>`.
+
 ## Status
 
 Boots, menus, new game, Lighthouse, Welcome to Rapture, Medical Pavilion, saving. See `docs/STATUS.md`.
