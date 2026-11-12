@@ -1,0 +1,65 @@
+diff --git a/include/rex/graphics/pipeline/shader/dxbc_translator.h b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+--- a/include/rex/graphics/pipeline/shader/dxbc_translator.h
++++ b/include/rex/graphics/pipeline/shader/dxbc_translator.h
+@@ -1109,6 +1109,9 @@
+   // .w stores `base + index * stride` in bytes from the last vfetch_full as it
+   // may be needed by vfetch_mini.
+   uint32_t system_temp_grad_v_vfetch_address_;
++  // bioshock-recomp: .x != 0 once any vfetch of this vertex read past the end of its
++  // vertex buffer (see vfetch_bounds_check). Such a vertex is dropped at the end of the shader.
++  uint32_t system_temp_bs_vfetch_oob_;
+ 
+   // The bool constant number containing the condition for the currently
+   // processed exec (or the last - unless a label has reset this), or
+diff --git a/src/graphics/pipeline/shader/dxbc_translator.cpp b/src/graphics/pipeline/shader/dxbc_translator.cpp
+--- a/src/graphics/pipeline/shader/dxbc_translator.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator.cpp
+@@ -27,6 +27,7 @@
+ REXCVAR_DEFINE_BOOL(dxbc_switch, true, "GPU/Shader", "Use switch statements in DXBC");
+ 
+ REXCVAR_DEFINE_BOOL(bioshock_kill_runaway_vertices, true, "GPU/Shader", "BioShock: kill primitives whose vertex position is non-finite or |W| > 1e8 (garbage skinning -> screen-wide streaks)");
++REXCVAR_DEFINE_BOOL(vfetch_oob_kills_vertex, true, "GPU/Shader", "BioShock: drop a vertex (W = NaN) when one of its vertex fetches ran past the end of the vertex buffer, instead of placing it at zeroed data (a far-away point -> streaks from corpses)");
+ REXCVAR_DEFINE_BOOL(dxbc_source_map, false, "GPU/Shader", "Generate source maps for DXBC");
+ 
+ namespace rex::graphics {
+@@ -890,6 +891,7 @@
+     system_temp_loop_count_ = PushSystemTemp(0b1111);
+     system_temp_grad_h_lod_ = PushSystemTemp(0b1111);
+     system_temp_grad_v_vfetch_address_ = PushSystemTemp(0b1111);
++    system_temp_bs_vfetch_oob_ = PushSystemTemp(0b0001);
+   }
+ 
+   // Write stage-specific prologue.
+@@ -1055,7 +1057,17 @@
+     // - system_temp_loop_count_.
+     // - system_temp_grad_h_lod_.
+     // - system_temp_grad_v_vfetch_address_.
+-    PopSystemTemp(6);
++    // - system_temp_bs_vfetch_oob_ (bioshock-recomp).
++    // bioshock-recomp: with vfetch_bounds_check an out-of-bounds vertex reads zeros, so its
++    // skinned position collapses to one far-away point and its triangles become screen-long
++    // streaks (ragdolls / shocked corpses, 2026-11-12). Drop that vertex instead: W = NaN.
++    if (is_vertex_shader() && REXCVAR_GET(vfetch_oob_kills_vertex)) {
++      a_.OpMovC(dxbc::Dest::R(system_temp_position_, 0b1000),
++                dxbc::Src::R(system_temp_bs_vfetch_oob_, dxbc::Src::kXXXX),
++                dxbc::Src::LF(std::nanf("")),
++                dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW));
++    }
++    PopSystemTemp(7);
+   }
+ 
+   uint8_t memexport_eM_written = current_shader().memexport_eM_written();
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+--- a/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_fetch.cpp
+@@ -240,6 +240,10 @@
+              dxbc::Src::R(bc_temp, dxbc::Src::kZZZZ));
+     a_.OpMovC(dxbc::Dest::R(system_temp_result_, needed_words), dxbc::Src::R(bc_temp, dxbc::Src::kXXXX),
+               dxbc::Src::LU(0), dxbc::Src::R(system_temp_result_));
++    // Remember it for the end of the shader (vfetch_oob_kills_vertex).
++    a_.OpOr(dxbc::Dest::R(system_temp_bs_vfetch_oob_, 0b0001),
++            dxbc::Src::R(system_temp_bs_vfetch_oob_, dxbc::Src::kXXXX),
++            dxbc::Src::R(bc_temp, dxbc::Src::kXXXX));
+     PopSystemTemp();
+   }
+ 

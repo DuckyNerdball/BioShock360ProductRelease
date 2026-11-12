@@ -1,0 +1,189 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "BioShock (Xbox 360) Recomp",
+  "repo": "DuckyNerdball/BioShock360ProductRelease",
+  "game": {
+    "kind": "folder",
+    "label": "The folder extracted from your own BioShock (Xbox 360) disc 1, the one with default.xex. Only the build with title ID 545407D8 and default.xex SHA-1 1be6a0fadea96b3825e6213a4a4ae1a0e4c96c91 is supported.",
+    "check": {
+      "file": "default.xex"
+    }
+  },
+  "start": {
+    "program": [
+      "bioshock.exe",
+      "app/out/build/win-amd64-relwithdebinfo/bioshock.exe"
+    ],
+    "args": [
+      "--game_data_root",
+      "{game}",
+      "--user_data_root",
+      "{install}/userdata",
+      "--log_file",
+      "{install}/bioshock.log",
+      "--gpu_plugin",
+      "xenos",
+      "--resolve_1011_exp_bias=0",
+      "--fetch_1011_exp_adjust_delta=-4",
+      "--skip_hdr_1011_resolve_bias=-3",
+      "--bioshock_sharp_composite",
+      "--resolution_scale=2",
+      "--anisotropic_override=5",
+      "--present_cas_additional_sharpness=0.7",
+      "--bioshock_bloom_scale=1.0",
+      "--bioshock_gamma=1.05",
+      "--bioshock_exposure_scale=1.55",
+      "--present_effect=cas",
+      "--swap_post_effect=fxaa",
+      "--present_dither=true",
+      "--texture_cache_memory_limit_soft=2048",
+      "--texture_cache_memory_limit_hard=4096",
+      "--texture_cache_memory_limit_render_to_texture=128",
+      "--draw_resolution_scaled_texture_offsets=false",
+      "--video_mode_refresh_rate=120",
+      "--skip_pixel_shaders=0",
+      "--direct_host_resolve=true"
+    ]
+  },
+  "saves": [
+    "{install}/userdata"
+  ],
+  "folders": {
+    "saves": [
+      {
+        "path": "{install}/userdata"
+      }
+    ],
+    "logs": [
+      {
+        "path": "{install}"
+      }
+    ]
+  },
+  "settings": [
+    {
+      "id": "resolution",
+      "label": "Resolution",
+      "in": "args",
+      "help": "What the game draws at. 720p is the console's own. 4K needs a fast graphics card.",
+      "choices": [
+        {
+          "label": "1440p",
+          "args": []
+        },
+        {
+          "label": "720p",
+          "args": [
+            "--resolution_scale=1"
+          ]
+        },
+        {
+          "label": "4K",
+          "args": [
+            "--resolution_scale=3"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "picture",
+      "label": "Picture",
+      "in": "args",
+      "help": "16:9 is the console's shape. 21:9 fills an ultrawide screen; the view is cropped top and bottom, so raise the field of view in the F9 menu to about 92.",
+      "choices": [
+        {
+          "label": "16:9",
+          "args": []
+        },
+        {
+          "label": "21:9 ultrawide",
+          "args": [
+            "--video_mode_width=1720",
+            "--video_mode_height=720"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "frame_rate",
+      "label": "Frame rate",
+      "in": "args",
+      "help": "60 is smooth and plays at normal speed. 30 is the console's own.",
+      "choices": [
+        {
+          "label": "60",
+          "args": []
+        },
+        {
+          "label": "30, as on console",
+          "args": [
+            "--video_mode_refresh_rate=60"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sharpening",
+      "label": "Sharpening",
+      "in": "args",
+      "help": "How the picture is fitted to your screen. CAS keeps edges crisp. Off is the softest.",
+      "choices": [
+        {
+          "label": "CAS",
+          "args": []
+        },
+        {
+          "label": "FSR",
+          "args": [
+            "--present_effect=fsr"
+          ]
+        },
+        {
+          "label": "Off",
+          "args": [
+            "--present_effect=bilinear"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "aa",
+      "label": "Anti-aliasing",
+      "in": "args",
+      "help": "Smooths jagged edges after the frame is drawn. Stronger is a little softer.",
+      "choices": [
+        {
+          "label": "FXAA",
+          "args": []
+        },
+        {
+          "label": "FXAA, stronger",
+          "args": [
+            "--swap_post_effect=fxaa_extreme"
+          ]
+        },
+        {
+          "label": "Off",
+          "args": [
+            "--swap_post_effect=none"
+          ]
+        }
+      ]
+    }
+  ],
+  "actions": [
+    {
+      "id": "saves",
+      "label": "Saves",
+      "help": "Your saves and profile.",
+      "open": "saves"
+    },
+    {
+      "id": "logs",
+      "label": "Log",
+      "help": "The log of the last run, for bug reports.",
+      "open": "logs"
+    }
+  ]
+}

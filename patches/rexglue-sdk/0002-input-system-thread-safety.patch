@@ -1,0 +1,82 @@
+diff -ru a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+--- a/include/rex/input/input_system.h	2026-11-08 20:34:06.852716839 +0000
++++ b/include/rex/input/input_system.h	2026-11-08 20:34:06.923716838 +0000
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <memory>
++#include <mutex>
+ #include <vector>
+ 
+ #include <rex/input/device_assignment.h>
+@@ -67,6 +68,11 @@
+   // does not renumber pad two.
+   std::vector<DeviceInfo> devices_;
+   std::vector<InputDriver*> device_owners_;
++
++  // Guest titles poll XamInputGetState/GetCapabilities from several threads at once (BioShock Infinite);
++  // RefreshDevices rebuilds devices_ on every call, so unguarded it freed vectors under another
++  // thread -> heap corruption / AV in ~DeviceInfo. Recursive: public calls nest RefreshDevices.
++  mutable std::recursive_mutex mutex_;
+ };
+ 
+ /// Create a default InputSystem with SDL + NOP drivers.
+diff -ru a/src/input/input_system.cpp b/src/input/input_system.cpp
+--- a/src/input/input_system.cpp	2026-11-08 20:34:06.840716839 +0000
++++ b/src/input/input_system.cpp	2026-11-08 20:34:06.915716838 +0000
+@@ -48,6 +48,7 @@
+ }
+ 
+ void InputSystem::Shutdown() {
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   // device_owners_ holds raw driver pointers.
+   devices_.clear();
+   device_owners_.clear();
+@@ -79,6 +80,7 @@
+ }
+ 
+ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment) {
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   assignment_ = std::move(assignment);
+   if (assignment_) {
+     assignment_->OnDevicesChanged(devices_);
+@@ -86,6 +88,7 @@
+ }
+ 
+ void InputSystem::RefreshDevices() {
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   std::vector<DeviceInfo> seen;
+   std::vector<InputDriver*> owners;
+   std::vector<DeviceInfo> enumerated;
+@@ -193,6 +196,7 @@
+ 
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!out_caps || !assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+@@ -220,6 +224,7 @@
+ }
+ 
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+@@ -259,6 +264,7 @@
+ }
+ 
+ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+@@ -301,6 +307,7 @@
+ 
+ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* out_keystroke) {
++  std::lock_guard<std::recursive_mutex> lock(mutex_);
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;

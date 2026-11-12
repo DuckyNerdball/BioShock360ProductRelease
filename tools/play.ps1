@@ -5,10 +5,35 @@
 #   .\tools\play.ps1 -Look Cinematic    # original DOF/bloom on
 #   Any explicit flag overrides the look:  -Look Ultra -Scale 5 -Sharpness 0.4 -AA none -Dof -Delta -4
 #   .\tools\play.ps1 -Dof -Bloom 0.25 -Exposure 1.5   # real bloom at 25% strength (needs SDK patch: bioshock_bloom_scale)
+#   .\tools\play.ps1 -Ultrawide -Scale 2   # 21:9 monitors (3440x1440 native)
 #   .\tools\play.ps1 -Fps30          # original 30 fps cap (default is 60 fps via 120 Hz guest vblank)
 #   .\tools\play.ps1 -Extra '--some_cvar=1','--other=2'   # pass raw cvars through
 #   .\tools\play.ps1 -RestoreAA         # put the original ConfigINI.IBF back and exit
-param([ValidateSet('Pure','Crisp','Sharp','Clean','Ultra','Cinematic','BS2')][string]$Look, [ValidateRange(1,6)][int]$Scale, [int]$Delta, [ValidateRange(-1,5)][int]$Aniso = 5, [ValidateSet('bilinear','cas','fsr')][string]$Present = 'cas', [double]$Sharpness, [double]$Bloom, [double]$Exposure, [double]$Gamma, [switch]$Fps30, [switch]$Dof, [switch]$NoDof, [ValidateSet('none','fxaa','fxaa_extreme')][string]$AA, [switch]$NoDirectResolve, [switch]$SkipComposite, [switch]$RestoreAA, [string]$Preset = "win-amd64-relwithdebinfo", [string[]]$Extra = @(), [string]$Project = "bioshock", [string]$GameDir = "game_base1")
+param([ValidateSet('Pure','Crisp','Sharp','Clean','Ultra','Cinematic','BS2')][string]$Look, [ValidateRange(1,6)][int]$Scale, [int]$Delta, [ValidateRange(-1,5)][int]$Aniso = 5, [ValidateSet('bilinear','cas','fsr')][string]$Present = 'cas', [double]$Sharpness, [double]$Bloom, [double]$Exposure, [double]$Gamma, [switch]$Fps30, [switch]$Dof, [switch]$NoDof, [ValidateSet('none','fxaa','fxaa_extreme')][string]$AA, [switch]$NoDirectResolve, [switch]$SkipComposite, [switch]$RestoreAA, [switch]$Ultrawide, [switch]$Remember, [switch]$Default, [string]$Preset = "win-amd64-relwithdebinfo", [string[]]$Extra = @(), [string]$Project = "bioshock", [string]$GameDir = "game_base1")
+# -Remember (go.ps1 always passes it): the options you launch with are saved to run\launch.json and reused the next
+# time you launch with none. -Default clears them. The WinForms launcher does not pass -Remember, so it is unaffected.
+if ($Remember) {
+    $lf = Join-Path (Split-Path -Parent $PSScriptRoot) 'run\launch.json'
+    $given = @{}
+    foreach ($k in @($PSBoundParameters.Keys)) {
+        if ($k -notin 'Remember', 'Default', 'RestoreAA') { $v = $PSBoundParameters[$k]; if ($v -is [switch]) { $v = [bool]$v }; $given[$k] = $v }
+    }
+    if ($Default) { if (Test-Path $lf) { Remove-Item $lf -Force }; Write-Host 'Saved launch options cleared.' -ForegroundColor Cyan }
+    elseif ($RestoreAA) { }
+    elseif ($given.Count -gt 0) { try { $given | ConvertTo-Json | Set-Content -Path $lf -Encoding UTF8 } catch { } }
+    elseif (Test-Path $lf) {
+        $saved = @{}
+        try { (Get-Content $lf -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $saved[$_.Name] = $_.Value } } catch { $saved = @{} }
+        if ($saved.Count -gt 0) {
+            Write-Host ('Using your saved launch options: ' + (($saved.Keys | Sort-Object | ForEach-Object { "-$_ $($saved[$_])" }) -join ' ') + '   (.\go.ps1 -Default to clear)') -ForegroundColor Cyan
+            & $PSCommandPath @saved
+            return
+        }
+    }
+}
+# -Ultrawide: tell the game its screen is 21:9 (1720x720; at -Scale 2 that is exactly 3440x1440). Works: the 3D view and HUD
+# both adapt (2026-11-10). The view is cropped top and bottom, so pair it with a wider field of view (F9, about 92 = original).
+if ($Ultrawide) { $Extra += '--video_mode_width=1720', '--video_mode_height=720' }
 . (Join-Path $PSScriptRoot 'look.ps1')
 if (-not $Look) { $Look = if ($Project -eq 'bioshock2') { 'BS2' } else { 'Pure' } }  # per-game default look
 $L = $Looks[$Look].Clone()

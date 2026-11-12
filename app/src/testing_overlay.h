@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 
 #include <string>
 #include <vector>
@@ -19,6 +20,9 @@ bool BsEngineReady();
 #include <deque>
 void BsQueueGive(std::string cls);
 void BsSetDoubleEncounters(bool on);  // give.cpp
+void BsBridgeRequest(std::string name);  // give.cpp: BS2 package bridge test (StaticLoadObject, result in the log)
+void BsSetFov(int v); int BsGetFov();  // give.cpp: field of view (0 = game default)
+void BsSetPopulation(int m); void BsSetRepop(int m); void BsPopDump(); std::string BsPopStatus();  // give.cpp: population dial
 void BsP2Request(bool detach, std::string view);
 bool BsP2KeyboardActive();
 void BsP2ToggleKeyboard();
@@ -53,6 +57,7 @@ void BsPanelOpen(bool open);
 void BsFreezeWorld(bool on);
 void BsClearGiveLog();
 void BsP2Release();
+bool BsCoopShortcuts(); void BsSetCoopShortcuts(bool on); void BsCoopEnd();  // give.cpp
 uint32_t BsP2Pawn();
 std::deque<std::string> BsGiveLog();
 void BsScanNames(std::string needle);
@@ -107,6 +112,7 @@ class TestingDialog : public rex::ui::ImGuiDialog {
   }
 
   void OnDraw(ImGuiIO& io) override {
+    if (!prefs_loaded_) { prefs_loaded_ = true; LoadPrefs(); }
     PollPad(io);
     static bool s_cleaned = false;  // undo a rivet tracer saved by an older build
     if (!s_cleaned && BsEngineReady()) { s_cleaned = true; BsQueueCommand("set Pistol TracerEffects ()"); }
@@ -116,7 +122,8 @@ class TestingDialog : public rex::ui::ImGuiDialog {
     }
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     if (just_opened_) { ImGui::SetNextWindowFocus(); just_opened_ = false; }
-    ImGui::SetNextWindowSize(ImVec2(620, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(820, 0), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(560, 240), ImVec2(1600, io.DisplaySize.y * 0.92f));
     if (!ImGui::Begin("Testing (F9)", nullptr, ImGuiWindowFlags_NoCollapse)) {
       ImGui::End();
       return;
@@ -133,16 +140,65 @@ class TestingDialog : public rex::ui::ImGuiDialog {
                          "Engine not captured yet - open/close the pause menu once.");
     }
 
-    ImGui::SeparatorText("Player");
-    if (ImGui::Checkbox("God mode (invulnerable)", &god_)) BsQueueCommand("god");
-
+    ImGui::TextDisabled("World paused while this menu is open.  Tabs: LB / RB or click.  Close: F9, Esc or L3+R3.");
+    // Quick row: the things used most, on every tab.
+    if (ImGui::Checkbox("God mode", &god_)) BsQueueCommand("god");
     ImGui::SameLine();
+    if (ImGui::Button("Refill health + EVE")) BsQueueGive("refill");
+    ImGui::SameLine();
+    if (ImGui::Button("All ammo")) GiveAllAmmo();
+    ImGui::SameLine();
+    if (ImGui::Button("Close menu")) Toggle();
+    // Esc closes the menu, unless it is busy closing a drop-down or leaving a text box. (Not B: the press would
+    // reach the game as the menu closes, and B uses a first aid kit.)
+    if (!ImGui::IsAnyItemActive() && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) &&
+        ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+      Toggle();
+    {
+      // LB / RB step through the tabs (controller); tab_jump_ selects one for a single frame.
+      const int kTabs = 6;
+      tab_jump_ = -1;
+      if (restore_tab_) { restore_tab_ = false; tab_jump_ = prefs_tab_; }   // reopen on the tab used last time
+      if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) tab_jump_ = (tab_ + kTabs - 1) % kTabs;
+      if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) tab_jump_ = (tab_ + 1) % kTabs;
+    }
+    if (ImGui::BeginTabBar("##tabs")) {
+      if (ImGui::BeginTabItem("Player", nullptr, tab_jump_ == 0 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        tab_ = 0;
     if (ImGui::Checkbox("Noclip (fly through walls)", &noclip_)) BsQueueCommand(noclip_ ? "ghost" : "walk");
 
     ImGui::SameLine();
     if (ImGui::Button("Teleport to crosshair")) BsQueueCommand("teleport");
 
-    ImGui::SeparatorText("Travel to level (use a spare save - may skip story state)");
+    { int fov = BsGetFov(); bool on = fov != 0; if (!on) fov = 75;
+      if (ImGui::Checkbox("Custom field of view", &on)) BsSetFov(on ? 95 : 0);
+      if (on) { ImGui::SameLine(); ImGui::SetNextItemWidth(260); if (ImGui::SliderInt("##fov", &fov, 60, 120, "%d degrees")) BsSetFov(fov); } }
+    ImGui::SeparatorText("Health / EVE");
+    {
+      // Item class names from the 360 build's name table (MedHypoPickup / EVEHypoPickup /
+      // BioAmmoHypo); several spellings are tried, whichever loads is given (the rest log "not found").
+      static const char* kMed[] = {"ShockDesignerClasses.MedHypo"};  // confirmed 2026-11-01
+      static const char* kEve[] = {"ShockDesignerClasses.BioAmmoHypo"};  // confirmed 2026-11-01
+      auto give = [](const char* const* list, int n, int count) {
+        for (int i = 0; i < n; ++i) BsQueueGive(std::string(list[i]) + " x" + std::to_string(count));
+      };
+      if (ImGui::Button("First aid kits +1")) give(kMed,1, 1);
+      ImGui::SameLine();
+      if (ImGui::Button("First aid kits max")) give(kMed,1, 99);
+      ImGui::SameLine();
+      if (ImGui::Button("EVE hypos +1")) give(kEve,1, 1);
+      ImGui::SameLine();
+      if (ImGui::Button("EVE hypos max")) give(kEve,1, 99);
+      if (ImGui::Button("Max health + EVE upgrades (tonics)")) {
+        for (const char* t : {"HealthPoolBoost", "HealthPoolBoostTwo", "HealthPoolBoostThree",
+                              "BioAmmoPoolBoost", "BioAmmoPoolBoostTwo", "BioAmmoPoolBoostThree"})
+          BsQueueGive(std::string("plasmid:") + t);
+      }
+      ImGui::SameLine();
+      if (ImGui::Button("Refill health + EVE now")) BsQueueGive("refill");
+    }
+
+    ImGui::SeparatorText("Travel to level (spare save: may skip story state)");
     static const char* kMaps[] = {"0-Lighthouse", "1-Welcome",  "1-Medical",   "2-Fisheries",
                                   "2-SubBay",     "3-Arcadia",  "3-Market",    "4-Recreation",
                                   "5-Hephaestus", "5-Ryan",     "6-Resi",      "6-Slums",
@@ -152,7 +208,11 @@ class TestingDialog : public rex::ui::ImGuiDialog {
     ImGui::SameLine();
     if (ImGui::Button("Go")) BsQueueCommand(std::string("open ") + kMaps[map_idx_]);
 
-    ImGui::SeparatorText("Give");
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Items", nullptr, tab_jump_ == 1 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        tab_ = 1;
+    ImGui::SeparatorText("Give everything");
     if (ImGui::Button("All weapons (direct give)")) {
       static const char* kW[] = {"WrenchPickupItem", "PistolPickupItem", "MachineGunPickupItem",
                                  "ShotgunPickupItem", "GrenadeLauncherPickupItem",
@@ -161,19 +221,7 @@ class TestingDialog : public rex::ui::ImGuiDialog {
       for (const char* w : kW) BsQueueGive(std::string("ShockDesignerClasses.") + w);
     }
     ImGui::SameLine();
-    if (ImGui::Button("All ammo")) {
-      // Every ammo class the 360 build accepts (found by the memory scan, 2026-11-01).
-      static const char* kA[] = {
-          "Pistol_Bullet", "Pistol_AntiPersonnel", "Pistol_ArmorPiercing",
-          "MachineGun_Bullet", "MachineGun_ArmorPiercingBullet", "MachineGun_FrozenBullet",
-          "MachineGun_RubberBullet", "Shotgun_00Buck", "Shotgun_IonicBuck",
-          "Shotgun_HighExplosiveBuck", "ChemicalThrower_Kerosene", "ChemicalThrower_LiquidNitrogen",
-          "ChemicalThrower_IonicGel", "ChemicalThrower_Accelerant", "Crossbow_Bolt",
-          "Crossbow_ArmorPiercingBolt", "Crossbow_DiseaseBolt", "Crossbow_SuperHeatedBolt",
-          "Crossbow_TrapBolt", "GrenadeLauncher_FragGrenade", "GrenadeLauncher_LiquidNitrogen",
-          "GrenadeLauncher_RPG", "GrenadeLauncher_StickyGrenade"};
-      for (const char* x : kA) BsQueueGive(std::string("ShockGame.") + x + " x99");
-    }
+    if (ImGui::Button("All ammo")) GiveAllAmmo();
     ImGui::SameLine();
     if (ImGui::Button("All plasmids + tonics")) {
       static const char* kP[] = {
@@ -207,42 +255,6 @@ class TestingDialog : public rex::ui::ImGuiDialog {
     bool gent = ImGui::InputText("##give", give_, sizeof(give_), ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
     if ((ImGui::Button("Give class") || gent) && give_[0]) BsQueueGive(give_);
-    {
-      static bool verbose = false;
-      if (ImGui::Checkbox("Verbose log", &verbose)) BsSetVerbose(verbose);
-      ImGui::SameLine();
-      if (ImGui::SmallButton("Clear log")) BsClearGiveLog();
-      ImGui::BeginChild("##givelog", ImVec2(0, 110 * font_scale_), true);
-      for (const auto& g : BsGiveLog()) ImGui::TextUnformatted(g.c_str());
-      ImGui::SetScrollHereY(1.0f);
-      ImGui::EndChild();
-    }
-
-    ImGui::SeparatorText("Health / EVE");
-    {
-      // Item class names from the 360 build's name table (MedHypoPickup / EVEHypoPickup /
-      // BioAmmoHypo); several spellings are tried, whichever loads is given (the rest log "not found").
-      static const char* kMed[] = {"ShockDesignerClasses.MedHypo"};  // confirmed 2026-11-01
-      static const char* kEve[] = {"ShockDesignerClasses.BioAmmoHypo"};  // confirmed 2026-11-01
-      auto give = [](const char* const* list, int n, int count) {
-        for (int i = 0; i < n; ++i) BsQueueGive(std::string(list[i]) + " x" + std::to_string(count));
-      };
-      if (ImGui::Button("First aid kits +1")) give(kMed,1, 1);
-      ImGui::SameLine();
-      if (ImGui::Button("First aid kits max")) give(kMed,1, 99);
-      ImGui::SameLine();
-      if (ImGui::Button("EVE hypos +1")) give(kEve,1, 1);
-      ImGui::SameLine();
-      if (ImGui::Button("EVE hypos max")) give(kEve,1, 99);
-      if (ImGui::Button("Max health + EVE upgrades (tonics)")) {
-        for (const char* t : {"HealthPoolBoost", "HealthPoolBoostTwo", "HealthPoolBoostThree",
-                              "BioAmmoPoolBoost", "BioAmmoPoolBoostTwo", "BioAmmoPoolBoostThree"})
-          BsQueueGive(std::string("plasmid:") + t);
-      }
-      ImGui::SameLine();
-      if (ImGui::Button("Refill health + EVE now")) BsQueueGive("refill");
-    }
-
     ImGui::SeparatorText("Plasmids");
     // Spawns a Gene Bank (plasmid/tonic swap station) in front of you; walk up and use it.
     // Slot upgrades (the "+1 slot" Gatherer's Garden purchases): one item per slot, per track.
@@ -259,6 +271,10 @@ class TestingDialog : public rex::ui::ImGuiDialog {
     ImGui::SameLine();
     ImGui::TextDisabled("then walk up and use it");
 
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Weapons", nullptr, tab_jump_ == 2 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        tab_ = 2;
     ImGui::SeparatorText("Weapon mods (live; untick to restore)");
     {
       // Ammo class defaults hold the firing behaviour (found with "props", 2026-11-01).
@@ -340,14 +356,27 @@ class TestingDialog : public rex::ui::ImGuiDialog {
       BsQueueCommand("summon ShockAIClasses.SpawnedMeleeThug");
     }
 
-    ImGui::SeparatorText("Spawn in front of me");
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Enemies", nullptr, tab_jump_ == 3 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        tab_ = 3;
+    ImGui::SeparatorText("Encounters");
     static const char* kSpawn[] = {
         "SpawnedMeleeThug",          "SpawnedRangedAggressorPistol", "SpawnedRangedAggressorSMG",
         "SpawnedGrenadier",          "SpawnedAssassin",              "SpawnedCeilingCrawler",
         "SpawnedBouncer",            "SpawnedRosie",                 "SpawnedBouncerElite",
         "SpawnedRosieElite"};
     if (ImGui::Checkbox("Double encounters (every spawned enemy x2)", &double_enc_)) BsSetDoubleEncounters(double_enc_);
-    if (ImGui::Checkbox("Freeze world (stays frozen after closing F9)", &freeze_world_)) BsFreezeWorld(freeze_world_);
+    ImGui::SeparatorText("Population (this level's spawn zones)");
+    { static const char* kPop[] = {"x1 (original)", "x2", "x3", "x4"};
+      ImGui::SetNextItemWidth(200);
+      if (ImGui::Combo("Enemies per zone", &pop_mult_, kPop, IM_ARRAYSIZE(kPop))) BsSetPopulation(pop_mult_ + 1);
+      static const char* kRep[] = {"Level default", "Always on", "Always off"};
+      ImGui::SetNextItemWidth(200);
+      if (ImGui::Combo("Respawning", &pop_repop_, kRep, IM_ARRAYSIZE(kRep))) BsSetRepop(pop_repop_);
+      ImGui::TextDisabled("%s", BsPopStatus().c_str());
+      ImGui::SameLine(); if (ImGui::SmallButton("Log zones")) BsPopDump(); }
+    ImGui::SeparatorText("Spawn one now");
     ImGui::SetNextItemWidth(260);
     ImGui::Combo("##spawn", &spawn_idx_, kSpawn, IM_ARRAYSIZE(kSpawn));
     ImGui::SameLine();
@@ -355,10 +384,17 @@ class TestingDialog : public rex::ui::ImGuiDialog {
       BsQueueCommand(std::string("summon ShockAIClasses.") + kSpawn[spawn_idx_]);
     }
 
-    ImGui::SeparatorText("Player 2 (second controller)");
+    ImGui::SeparatorText("World");
+    if (ImGui::Checkbox("Keep the world frozen after closing this menu", &freeze_world_)) BsFreezeWorld(freeze_world_);
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Co-op", nullptr, tab_jump_ == 4 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        tab_ = 4;
     {
       static int p2_idx = 0;
       static const char* kP2[] = {"SpawnedBouncer", "SpawnedRosie", "SpawnedMeleeThug", "SpawnedRangedThug"};
+      { bool sc = BsCoopShortcuts();
+        if (ImGui::Checkbox("Co-op shortcuts (controller 2 A/Start, D-pad down x5, triple F8 spawn a Big Daddy)", &sc)) BsSetCoopShortcuts(sc); }
       ImGui::SetNextItemWidth(220);
       ImGui::Combo("##p2", &p2_idx, kP2, IM_ARRAYSIZE(kP2));
       ImGui::SameLine();
@@ -366,7 +402,37 @@ class TestingDialog : public rex::ui::ImGuiDialog {
       ImGui::SameLine();
       if (ImGui::Button("Release P2")) BsP2Release();
       ImGui::SameLine();
+      if (ImGui::Button("End co-op (remove him, close window 2)")) BsCoopEnd();
+      ImGui::SameLine();
       if (ImGui::Button(BsP2KeyboardActive() ? "Keyboard -> P1 (F8)" : "Keyboard -> P2 (F8)")) BsP2ToggleKeyboard();
+      bool split = BsCoopSplit();
+      if (ImGui::Checkbox("Two windows / co-op: controller = Jack (window 1), keyboard+mouse = Big Daddy (window 2)", &split)) BsSplitWindow(split);
+      static bool split_default = true;
+      if (ImGui::Checkbox("Open co-op split when P2 spawns (D-pad down x5 / triple F8)", &split_default)) BsSplitDefault(split_default);
+      if (split) {
+        bool inv = BsSplitInverted();
+        if (ImGui::Checkbox("Swap windows (F7)", &inv)) BsSplitInvert(inv);
+        ImGui::SameLine();
+        if (ImGui::Button(BsPadOnP2() ? "Controller -> Jack (Back / F6)" : "Controller -> Big Daddy (Back / F6)")) BsPadSwap();
+        {
+          // Second controller (couch, or a friend over Parsec / Moonlight) always drives the Big Daddy.
+          const char* items[] = {"auto (first pad after Jack's)", "controller 2", "controller 3", "controller 4"};
+          int sel = BsBdPad() < 1 ? 0 : BsBdPad();
+          ImGui::SetNextItemWidth(220);
+          if (ImGui::Combo("Big Daddy controller", &sel, items, 4)) BsSetBdPad(sel == 0 ? -1 : sel);
+          ImGui::SameLine();
+          ImGui::TextDisabled(BsBdPadNow() >= 0 ? "(connected: controller %d)" : "(none connected)", BsBdPadNow() + 1);
+          bool join = BsBdPadJoin();
+          if (ImGui::Checkbox("A / Start on that controller spawns the Big Daddy", &join)) BsSetBdPadJoin(join);
+          if (ImGui::Button(BsP2Fullscreen() ? "Big Daddy window: windowed (F11)" : "Big Daddy window: fullscreen (F11)")) BsToggleP2Fullscreen();
+          ImGui::SameLine(); ImGui::TextDisabled("stream this window to a friend (Parsec / Moonlight); their pad drives him");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("HUD to other window (F5)")) BsHudFlip();
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", BsSplitStats().c_str());
+      }
+      if (ImGui::CollapsingHeader("Advanced switches (debugging)")) {
       static bool rec = false;
       if (ImGui::Checkbox("Record AI Big Daddy attacks (log anims + damage calls)", &rec)) BsSetAttackRecorder(rec);
       static bool realw = true;
@@ -398,32 +464,6 @@ class TestingDialog : public rex::ui::ImGuiDialog {
       if (ImGui::RadioButton("P1", &view_mode, 0)) BsSetViewMode(0); ImGui::SameLine();
       if (ImGui::RadioButton("Alternate every frame (split test)", &view_mode, 1)) BsSetViewMode(1); ImGui::SameLine();
       if (ImGui::RadioButton("P2", &view_mode, 2)) BsSetViewMode(2);
-      bool split = BsCoopSplit();
-      if (ImGui::Checkbox("Two windows / co-op: controller = Jack (window 1), keyboard+mouse = Big Daddy (window 2)", &split)) BsSplitWindow(split);
-      static bool split_default = true;
-      if (ImGui::Checkbox("Open co-op split when P2 spawns (D-pad down x5 / triple F8)", &split_default)) BsSplitDefault(split_default);
-      if (split) {
-        bool inv = BsSplitInverted();
-        if (ImGui::Checkbox("Swap windows (F7)", &inv)) BsSplitInvert(inv);
-        ImGui::SameLine();
-        if (ImGui::Button(BsPadOnP2() ? "Controller -> Jack (Back / F6)" : "Controller -> Big Daddy (Back / F6)")) BsPadSwap();
-        {
-          // Second controller (couch, or a friend over Parsec / Moonlight) always drives the Big Daddy.
-          const char* items[] = {"auto (first pad after Jack's)", "controller 2", "controller 3", "controller 4"};
-          int sel = BsBdPad() < 1 ? 0 : BsBdPad();
-          ImGui::SetNextItemWidth(220);
-          if (ImGui::Combo("Big Daddy controller", &sel, items, 4)) BsSetBdPad(sel == 0 ? -1 : sel);
-          ImGui::SameLine();
-          ImGui::TextDisabled(BsBdPadNow() >= 0 ? "(connected: controller %d)" : "(none connected)", BsBdPadNow() + 1);
-          bool join = BsBdPadJoin();
-          if (ImGui::Checkbox("A / Start on that controller spawns the Big Daddy", &join)) BsSetBdPadJoin(join);
-          if (ImGui::Button(BsP2Fullscreen() ? "Big Daddy window: windowed (F11)" : "Big Daddy window: fullscreen (F11)")) BsToggleP2Fullscreen();
-          ImGui::SameLine(); ImGui::TextDisabled("stream this window to a friend (Parsec / Moonlight); their pad drives him");
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("HUD to other window (F5)")) BsHudFlip();
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", BsSplitStats().c_str());
       }
       static bool body = false;
       if (ImGui::Checkbox("Give Jack a body in the Big Daddy's view (Splicer model, EXPERIMENTAL; reload save to undo)", &body)) BsJackBody(body);
@@ -431,6 +471,29 @@ class TestingDialog : public rex::ui::ImGuiDialog {
                                      : "no P2 yet: pick a body, Spawn P2");
     }
 
+        ImGui::EndTabItem();
+      }
+      if (ImGui::BeginTabItem("Dev", nullptr, tab_jump_ == 5 ? ImGuiTabItemFlags_SetSelected : 0)) {
+        tab_ = 5;
+    ImGui::SeparatorText("Log");
+    {
+      static bool verbose = false;
+      if (ImGui::Checkbox("Verbose log", &verbose)) BsSetVerbose(verbose);
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Clear log")) BsClearGiveLog();
+      ImGui::BeginChild("##givelog", ImVec2(0, 110 * font_scale_), true);
+      for (const auto& g : BsGiveLog()) ImGui::TextUnformatted(g.c_str());
+      ImGui::SetScrollHereY(1.0f);
+      ImGui::EndChild();
+    }
+
+    ImGui::SeparatorText("BioShock 2 bridge test (expect a refusal or a crash: the log is the result)");
+    ImGui::SetNextItemWidth(300);
+    ImGui::InputText("##bs2", bs2_, sizeof(bs2_));
+    ImGui::SameLine();
+    if (ImGui::Button("Load BS2 object") && bs2_[0]) BsBridgeRequest(bs2_);
+    ImGui::SameLine();
+    ImGui::TextDisabled("BS2Mod = tiny package, BS2Game = its ShockGame");
     ImGui::SeparatorText("Custom command");
     ImGui::SetNextItemWidth(300);
     bool enter = ImGui::InputText("##cmd", custom_, sizeof(custom_),
@@ -457,7 +520,59 @@ class TestingDialog : public rex::ui::ImGuiDialog {
 
     ImGui::SeparatorText("Results");
     for (const auto& r : BsRecentResults()) ImGui::TextUnformatted(r.c_str());
+        ImGui::EndTabItem();
+      }
+      ImGui::EndTabBar();
+    }
+    SavePrefsIfChanged();
     ImGui::End();
+  }
+
+  // Every ammo class the 360 build accepts (found by the memory scan, 2026-11-01).
+  static void GiveAllAmmo() {
+    static const char* kA[] = {
+        "Pistol_Bullet", "Pistol_AntiPersonnel", "Pistol_ArmorPiercing",
+        "MachineGun_Bullet", "MachineGun_ArmorPiercingBullet", "MachineGun_FrozenBullet",
+        "MachineGun_RubberBullet", "Shotgun_00Buck", "Shotgun_IonicBuck",
+        "Shotgun_HighExplosiveBuck", "ChemicalThrower_Kerosene", "ChemicalThrower_LiquidNitrogen",
+        "ChemicalThrower_IonicGel", "ChemicalThrower_Accelerant", "Crossbow_Bolt",
+        "Crossbow_ArmorPiercingBolt", "Crossbow_DiseaseBolt", "Crossbow_SuperHeatedBolt",
+        "Crossbow_TrapBolt", "GrenadeLauncher_FragGrenade", "GrenadeLauncher_LiquidNitrogen",
+        "GrenadeLauncher_RPG", "GrenadeLauncher_StickyGrenade"};
+    for (const char* x : kA) BsQueueGive(std::string("ShockGame.") + x + " x99");
+  }
+  // Menu settings that survive a restart (run\\panel.txt): text size, last tab, population dial, double encounters.
+  static std::string PrefsText() {
+    return "text=" + std::to_string(font_scale_) + "\ntab=" + std::to_string(tab_) + "\npop=" + std::to_string(pop_mult_) +
+           "\nrepop=" + std::to_string(pop_repop_) + "\ndouble=" + std::to_string(double_enc_ ? 1 : 0) + "\n";
+  }
+  static void LoadPrefs() {
+    std::ifstream f("run\\panel.txt");
+    std::string l;
+    while (f && std::getline(f, l)) {
+      auto e = l.find('=');
+      if (e == std::string::npos) continue;
+      std::string k = l.substr(0, e);
+      float v = 0.0f;
+      try { v = std::stof(l.substr(e + 1)); } catch (...) { continue; }
+      if (k == "text") font_scale_ = std::clamp(v, 0.8f, 2.5f);
+      else if (k == "tab") prefs_tab_ = std::clamp(static_cast<int>(v), 0, 5);
+      else if (k == "pop") pop_mult_ = std::clamp(static_cast<int>(v), 0, 3);
+      else if (k == "repop") pop_repop_ = std::clamp(static_cast<int>(v), 0, 2);
+      else if (k == "double") double_enc_ = v != 0.0f;
+    }
+    tab_ = prefs_tab_;
+    if (pop_mult_) BsSetPopulation(pop_mult_ + 1);
+    if (pop_repop_) BsSetRepop(pop_repop_);
+    if (double_enc_) BsSetDoubleEncounters(true);
+    prefs_saved_ = PrefsText();
+  }
+  static void SavePrefsIfChanged() {
+    std::string now = PrefsText();
+    if (now == prefs_saved_) return;
+    prefs_saved_ = now;
+    std::ofstream f("run\\panel.txt");
+    f << now;
   }
 
  private:
@@ -475,8 +590,13 @@ class TestingDialog : public rex::ui::ImGuiDialog {
                      mod_gl3_ = false, mod_gimp_ = false, mod_rivet_ = false;
   static inline bool freeze_world_ = false;
   static inline bool double_enc_ = false;
+  static inline int pop_mult_ = 0, pop_repop_ = 0;
   static inline int spawn_idx_ = 0;
+  static inline int tab_ = 0, tab_jump_ = -1, prefs_tab_ = 0;
+  static inline bool prefs_loaded_ = false, restore_tab_ = true;
+  static inline std::string prefs_saved_;
   static inline char custom_[128] = {};
   static inline char scan_[64] = {};
+  static inline char bs2_[128] = "BS2Mod.ModEffectsSubsystem";
   static inline char give_[128] = "ShockDesignerClasses.ShotgunPickupItem";
 };

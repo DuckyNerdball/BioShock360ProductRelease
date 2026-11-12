@@ -218,11 +218,13 @@ void BsLevelChanging(bool on) {
   if (on && !g_level_changing.load()) REXLOG_INFO("bioshock-recomp: give: level change - P2 ticks paused until the new player is captured");
   g_level_changing = on;
 }
+void BsHangArm(bool on);   // crash_trace.cpp (declared outside the anonymous namespace: it links to the real one)
 namespace {
 bool InHeap(uint32_t a) { return a >= 0x40000000 && a < 0x5F000000; }
 void CapturePlayer(uint32_t p) {
   if (!InHeap(p) || g_player.load() == p) return;
   g_player = p;
+  { static bool armed = false; if (!armed) { armed = true; BsHangArm(true); } }
   g_level_changing = false;
   // New player = level/save load: everything cached from the old level is freed memory now.
   g_invmgr = 0;
@@ -297,7 +299,9 @@ static void BsPollCoopKeys() {
 }
 static void BsProbeJack(PPCContext& ctx, uint8_t* base);
 static void BsRunDevCmds(PPCContext& ctx, uint8_t* base);
+void BsHeartbeat();   // crash_trace.cpp: hang watchdog + kill=1
 void BsRunGives(PPCContext& ctx, uint8_t* base) {
+  BsHeartbeat();
   BsPollKnobs();
   BsPollCoopKeys();
   BsPollPadSpawnCombo();
@@ -868,6 +872,16 @@ std::atomic<bool> g_p2_autoswitch{false};
 bool BsPadPollIndex(int i, uint16_t* buttons, int16_t* lx, int16_t* ly, int16_t* rx, int16_t* ry, uint8_t* rt);
 // Spawn a Big Daddy and put you in control of him (triple F8, or D-pad down x5 on the controller).
 std::atomic<bool> g_p2_keep{false};  // a quick-spawned Big Daddy: bring him back after a reload / Jack's death
+// Co-op shortcuts (controller 2 A/Start, D-pad down x5, triple F8) are OFF unless switched on in F9 (saved in
+// run\coop_shortcuts.txt): testing with a keyboard and a pad kept spawning a Big Daddy by accident (2026-11-10).
+static std::atomic<int> g_coop_shortcuts{-1};
+bool BsCoopShortcuts() {
+  if (g_coop_shortcuts.load() < 0) { int v = 0; std::ifstream f("run\\coop_shortcuts.txt"); if (f) f >> v; g_coop_shortcuts = v ? 1 : 0; }
+  return g_coop_shortcuts.load() == 1;
+}
+void BsSetCoopShortcuts(bool on) { g_coop_shortcuts = on ? 1 : 0; std::ofstream f("run\\coop_shortcuts.txt"); f << (on ? 1 : 0) << "\n"; }
+std::atomic<bool> g_coop_end{false};   // F9 "End co-op": handled on the game thread (BsCoopEndTick)
+void BsCoopEnd() { g_coop_end = true; }
 void BsP2QuickSpawn(const char* why) {
   // One Big Daddy at a time: a second spawn dropped the first back to AI, and it killed Jack (2026-11-03).
   if (g_p2.load() && g_hud_hp.load() > 0.0f) { Log("P2: you already have a Big Daddy - Back / F6 or F8 to control him"); return; }
@@ -881,6 +895,7 @@ void BsP2QuickSpawn(const char* why) {
 // D-pad down pressed 5 times within 1.5 s (controller 1) = BsP2QuickSpawn. Polled every frame.
 void BsPollPadSpawnCombo() {
   // Big Daddy pad join: with no Big Daddy around, A / Start on the dedicated pad spawns one.
+  if (!BsCoopShortcuts()) return;
   if (g_bd_pad_join.load() && !g_p2.load() && !g_p2_want.load() && g_player.load()) {
     static auto s_last = std::chrono::steady_clock::now() - std::chrono::seconds(10);
     int want = g_bd_pad.load();
@@ -912,19 +927,10 @@ bool BsPanelIsOpen() { return g_panel_open.load(); }
 bool g_our_fire = false;  // set while P2's own (player-driven) weapon call runs
 bool g_panel_froze = false;
 bool g_user_frozen = false;  // "Freeze world" checkbox
-void BsPanelOpen(bool open) {
-  g_panel_open = open;
-  if (g_user_frozen) return;  // already frozen by the checkbox: leave it alone
-  if (open && !g_panel_froze) { g_panel_froze = true; BsQueueCommand("playersonly"); }
-  else if (!open && g_panel_froze) { g_panel_froze = false; BsQueueCommand("playersonly"); }
-}
-// "Freeze world" checkbox: playersonly is a toggle, so coordinate with the panel's own freeze.
-void BsFreezeWorld(bool on) {
-  if (on == g_user_frozen) return;
-  g_user_frozen = on;
-  if (g_panel_froze) { g_panel_froze = false; if (!on) BsQueueCommand("playersonly"); }  // hand over ownership
-  else BsQueueCommand("playersonly");
-}
+// The freeze itself is done on the game thread by BsFreezeTick (below): these only record what is wanted.
+void BsPanelOpen(bool open) { g_panel_open = open; }
+void BsFreezeWorld(bool on) { g_user_frozen = on; }
+bool BsWorldFrozen() { return g_panel_froze; }
 std::atomic<bool> g_p2_ally{true};
 std::atomic<bool> g_p2_silence{false};  // crashed: AI code reads Controller.Pawn->+0x430
 void BsP2Silence(bool on) { g_p2_silence = on; }
@@ -934,12 +940,12 @@ void BsP2ToggleKeyboard() {
   static std::chrono::steady_clock::time_point s_taps[3]{};
   auto now = std::chrono::steady_clock::now();
   s_taps[0] = s_taps[1]; s_taps[1] = s_taps[2]; s_taps[2] = now;
-  if (now - s_taps[0] < std::chrono::milliseconds(800)) {
+  if (BsCoopShortcuts() && now - s_taps[0] < std::chrono::milliseconds(800)) {
     s_taps[0] = s_taps[1] = s_taps[2] = {};
     BsP2QuickSpawn("triple F8");
     return;
   }
-  if (!g_p2.load()) { Log("P2: spawn a P2 first (F9 > Player 2), or triple-tap F8"); return; }
+  if (!g_p2.load()) { Log("P2: spawn a P2 first (F9 > Player 2)"); return; }
   g_p2_kbd = !g_p2_kbd.load();
   if (g_p2_kbd) { BsQueueCommand("viewclass " + g_p2_view); BsQueueCommand("behindview 1"); }
   else { BsQueueCommand("viewself"); BsQueueCommand("behindview 0"); }
@@ -1078,6 +1084,18 @@ static void SetBool(PPCContext& ctx, uint8_t* base, uint32_t obj, const char* na
 // for "Location". Two sessions picked different Children offsets (+64, +A0) and OnUsed was never found, so
 // every matching (children, next) pair is kept and FindFunction tries them all.
 static std::vector<std::pair<int, int>> g_field_lists;
+// Readable-memory check that remembers the last region VirtualQuery reported, so a walk over thousands of fields
+// costs a handful of queries instead of one each (one query per pointer was 2.4 s a pass in the population code).
+struct BsReadCache {
+  const uint8_t* lo = nullptr; const uint8_t* hi = nullptr;
+  bool ok(const uint8_t* p, size_t n) {
+    if (p >= lo && p + n <= hi) return true;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+    lo = static_cast<const uint8_t*>(mbi.BaseAddress); hi = lo + mbi.RegionSize;
+    return p + n <= hi || HostReadable(p, n);
+  }
+};
 static bool CalibrateFieldLists(PPCContext& ctx, uint8_t* base, uint32_t cls) {
   if (!g_field_lists.empty()) return true;
   static int s_tries = 0;
@@ -1092,13 +1110,17 @@ static bool CalibrateFieldLists(PPCContext& ctx, uint8_t* base, uint32_t cls) {
   uint32_t target = ctx.r3.u32;
   ctx = saved;
   if (!target) return false;
-  for (uint32_t c = cls, k = 0; c && HeapOrImg(c) && k < 16; c = BE32(base, c + 0x38), ++k)
+  // Every candidate (children, next) offset pair is walked, so most walks follow garbage: each pointer must be
+  // aligned, in range and readable before it is followed (crash_20261112_005657 read 0x5A773997 here).
+  BsReadCache rc;
+  auto good = [&](uint32_t a) { return a && !(a & 3) && HeapOrImg(a) && rc.ok(base + a, 0x48); };
+  for (uint32_t c = cls, k = 0; good(c) && k < 16; c = BE32(base, c + 0x38), ++k)
     for (int co = 0x3C; co <= 0xC0; co += 4)
       for (int no : {0x30, 0x34, 0x38, 0x3C, 0x40}) {
         if (no == co) continue;
         uint32_t f = BE32(base, c + co);
         bool hit = false;
-        for (int j = 0; j < 4000 && f && HeapOrImg(f) && !hit; ++j, f = BE32(base, f + no)) hit = f == target;
+        for (int j = 0; j < 4000 && good(f) && !hit; ++j, f = BE32(base, f + no)) hit = f == target;
         if (hit && std::find(g_field_lists.begin(), g_field_lists.end(), std::make_pair(co, no)) == g_field_lists.end())
           g_field_lists.push_back({co, no});
       }
@@ -1127,14 +1149,18 @@ static uint32_t FindFunction(PPCContext& ctx, uint8_t* base, uint32_t obj, const
   PPCContext saved = ctx;
   uint32_t sp = (ctx.r1.u32 - 0x5000) & ~0xFu, found = 0;
   std::vector<uint32_t> chain;
-  for (uint32_t c = cls, k = 0; c && HeapOrImg(c) && k < 16; c = BE32(base, c + 0x38), ++k) chain.push_back(c);
+  BsReadCache rc;   // crash_20261112_005657: a field list led to 0x5A773997 (unmapped, not even aligned)
+  auto good = [&](uint32_t a) { return a && !(a & 3) && HeapOrImg(a) && rc.ok(base + a, 0x48); };
+  for (uint32_t c = cls, k = 0; good(c) && k < 16; c = BE32(base, c + 0x38), ++k) chain.push_back(c);
   for (auto& pr : g_field_lists) {
     for (uint32_t c : chain) {
       uint32_t f = BE32(base, c + pr.first);
-      for (int j = 0; j < 4000 && f && HeapOrImg(f) && !found; ++j, f = BE32(base, f + pr.second)) {
+      for (int j = 0; j < 4000 && good(f) && !found; ++j, f = BE32(base, f + pr.second)) {
         if (FNameStr(ctx, base, f, sp) != name) { ctx = saved; continue; }
         ctx = saved;
-        std::string fc = ClassNameCached(ctx, base, BE32(base, f + 0x2C), sp);
+        uint32_t fcls = BE32(base, f + 0x2C);
+        if (!good(fcls)) continue;
+        std::string fc = ClassNameCached(ctx, base, fcls, sp);
         ctx = saved;
         if (fc.find("Function") != std::string::npos) found = f;
       }
@@ -1147,6 +1173,7 @@ static uint32_t FindFunction(PPCContext& ctx, uint8_t* base, uint32_t obj, const
     auto it = g_learned_fn.find(name);
     if (it != g_learned_fn.end())
       for (uint32_t f : it->second) {
+        if (!good(f)) continue;
         for (int o = 0x10; o <= 0x28 && !found; o += 4)
           if (std::find(chain.begin(), chain.end(), BE32(base, f + o)) != chain.end()) found = f;
         if (found) break;
@@ -1534,8 +1561,284 @@ static void BsAutoCloseRevive(PPCContext& ctx, uint8_t* base) {
     Log("ui: revive popup - pressed Close");
   }
 }
+// ---- World freeze while F9 is open (2026-11-10) ------------------------------------------------------------------
+// Was: the console toggle "playersonly" on open and again on close. A toggle goes out of step (level change, reload)
+// and then the world is frozen with the menu CLOSED. Now the flag itself, LevelInfo.bPlayersOnly, is held at the
+// wanted value every tick. Its bit is learned once: the first freeze still uses the console toggle and the bit that
+// changes in that word is the flag. Only a flag we set is ever cleared.
+static void BsFreezeTick(PPCContext& ctx, uint8_t* base) {
+  const bool want = g_panel_open.load() || g_user_frozen;
+  uint32_t pl = g_player.load();
+  if (!InHeap(pl)) return;
+  static uint32_t s_pl = 0, s_cls = 0, s_lvl_off = 0, s_off = 0, s_mask = 0, s_w0 = 0;
+  static bool s_learning = false; static auto s_learn_at = std::chrono::steady_clock::now();
+  if (pl != s_pl) { s_pl = pl; g_panel_froze = false; s_learning = false; }   // new level starts unfrozen
+  uint32_t cls = BE32(base, pl + 0x2C), o = 0, m = 0;
+  if (cls != s_cls) {
+    s_cls = cls; s_lvl_off = s_off = 0;
+    if (FindPropOffset(ctx, base, pl, "Level", &o, &m)) {
+      s_lvl_off = o;
+      uint32_t li = BE32(base, pl + o);
+      if (InHeap(li) && HostReadable(base + li, 0x40) && FindPropOffset(ctx, base, li, "bPlayersOnly", &o, &m)) s_off = o;
+    }
+    Log(fmt::format("freeze: player class {:08X}: Level at +{:X}, bPlayersOnly at +{:X}", cls, s_lvl_off, s_off));
+  }
+  uint32_t li = s_lvl_off ? BE32(base, pl + s_lvl_off) : 0;
+  const bool have = s_off && InHeap(li) && HostReadable(base + li + s_off, 4);
+  auto put = [&](uint32_t a, uint32_t v) { base[a] = uint8_t(v >> 24); base[a + 1] = uint8_t(v >> 16); base[a + 2] = uint8_t(v >> 8); base[a + 3] = uint8_t(v); };
+  if (have && s_mask) {   // direct: hold the flag
+    uint32_t w = BE32(base, li + s_off);
+    if (want && !(w & s_mask)) { put(li + s_off, w | s_mask); g_panel_froze = true; }
+    else if (want) g_panel_froze = true;
+    else if (g_panel_froze) { put(li + s_off, w & ~s_mask); g_panel_froze = false; }
+    return;
+  }
+  if (s_learning && have && std::chrono::steady_clock::now() - s_learn_at > std::chrono::milliseconds(300)) {
+    s_learning = false;
+    uint32_t diff = BE32(base, li + s_off) ^ s_w0;
+    if (diff && !(diff & (diff - 1))) { s_mask = diff; Log(fmt::format("freeze: LevelInfo.bPlayersOnly = +{:X} mask {:08X} (held directly from now on)", s_off, s_mask)); }
+    else Log(fmt::format("freeze: could not learn the flag (word changed by {:08X}); staying on the console toggle", diff));
+  }
+  if (s_learning || want == g_panel_froze) return;
+  if (have) { s_w0 = BE32(base, li + s_off); s_learning = true; s_learn_at = std::chrono::steady_clock::now(); }
+  BsQueueCommand("playersonly");
+  g_panel_froze = want;
+}
+
+// "End co-op" (F9): stop the auto-respawn (g_p2_keep brought him back 4 s after every release), give the keyboard and
+// camera back to Jack, close the second window, then remove the Big Daddy a second later (script Destroy).
+static void BsCoopEndTick(PPCContext& ctx, uint8_t* base) {
+  static uint32_t s_pawn = 0, s_cls = 0; static std::chrono::steady_clock::time_point s_at{};
+  if (g_coop_end.exchange(false)) {
+    g_p2_keep = false; g_p2_want = false; g_p2_autoswitch = false;
+    uint32_t p = g_p2.load();
+    if (g_p2_kbd.load()) { g_p2_kbd = false; BsQueueCommand("viewself"); BsQueueCommand("behindview 0"); }
+    g_p2 = 0;
+    if (BsCoopSplit()) BsSplitWindow(false);
+    if (InHeap(p) && HostReadable(base + p, 0x40)) { s_pawn = p; s_cls = BE32(base, p + 0x2C); s_at = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000); }
+    Log("co-op ended: no auto-respawn, window 2 closed, controls back to Jack");
+  }
+  if (s_pawn && std::chrono::steady_clock::now() >= s_at) {
+    uint32_t p = s_pawn; s_pawn = 0;
+    if (HostReadable(base + p, 0x40) && BE32(base, p + 0x2C) == s_cls) {
+      bool ok = CallEvent(ctx, base, p, "Destroy", {});
+      Log(ok ? "co-op ended: Big Daddy removed" : "co-op ended: could not remove the Big Daddy (he stays as an AI)");
+    }
+  }
+}
+
+// ---- Field of view (2026-11-10) ----------------------------------------------------------------------------------
+// Jack's PlayerController: FovAngle +0x42C (live), DesiredFOV +0x618 (the engine eases FovAngle towards it),
+// DefaultFOV +0x61C (75; what zooming returns to). Raising DefaultFOV, and DesiredFOV whenever it sits at the default,
+// widens the view and leaves zooms (camera, crossbow, death) working. Set from F9 or "fov=95" in run\knobs.txt; saved in
+// run\fov.txt. 0 = the game's own.
+static std::atomic<int> g_fov_want{-1};   // -1 = not loaded yet
+void BsSetFov(int v) { g_fov_want = (v < 50 || v > 130) ? 0 : v; std::ofstream f("run\\fov.txt"); f << g_fov_want.load() << "\n"; }
+int BsGetFov() {
+  if (g_fov_want.load() < 0) { int v = 0; std::ifstream f("run\\fov.txt"); if (f) f >> v; g_fov_want = (v < 50 || v > 130) ? 0 : v; }
+  return g_fov_want.load();
+}
+static void BsFovTick(uint8_t* base) {
+  uint32_t pl = g_player.load();
+  if (!InHeap(pl)) return;
+  uint32_t pc = BE32(base, pl + 0x420);
+  if (!InHeap(pc) || !HostReadable(base + pc + 0x618, 8)) return;
+  static uint32_t s_pc = 0; static float s_orig = 75.0f, s_set = 0.0f;
+  float want = float(BsGetFov()); if (want == 0.0f) want = BsKnob("fov", 0.0f);
+  if (want != 0.0f && (want < 50.0f || want > 130.0f)) want = 0.0f;
+  auto rd = [&](uint32_t a) { uint32_t v = BE32(base, a); float f; std::memcpy(&f, &v, 4); return f; };
+  auto wr = [&](uint32_t a, float f) { uint32_t v; std::memcpy(&v, &f, 4); base[a] = uint8_t(v >> 24); base[a + 1] = uint8_t(v >> 16); base[a + 2] = uint8_t(v >> 8); base[a + 3] = uint8_t(v); };
+  float def = rd(pc + 0x61C), des = rd(pc + 0x618);
+  if (!(def > 30.0f && def < 140.0f)) return;   // not a PlayerController we understand
+  if (pc != s_pc) { s_pc = pc; if (def != s_set) s_orig = def; s_set = 0.0f; }
+  const float target = want != 0.0f ? want : (s_set != 0.0f ? s_orig : 0.0f);   // 0 = nothing to do
+  if (target == 0.0f || def == target) { if (want == 0.0f) s_set = 0.0f; return; }
+  if (des == def) wr(pc + 0x618, target);
+  wr(pc + 0x61C, target);
+  s_set = want;
+  static int s_logs = 0;   // if the game keeps putting its own value back this would log every frame
+  if (s_logs < 40) { ++s_logs; REXLOG_INFO("bioshock-recomp: fov: default {:.0f} -> {:.0f}", def, target); }
+}
+
+// ---- Population dial (2026-11-10) --------------------------------------------------------------------------------
+// The level's spawning manager owns spawn zones; each zone has a desired splicer count range, a respawn delay range
+// and a respawn on/off flag (names from the PC editor guide, same classes here). The dial scales the count range,
+// divides the delay, and can force respawn on/off. Originals are kept per zone and restored at x1 / "level default".
+// Property offsets are looked up by name at runtime; the first manager and zone of a level are dumped to the log.
+namespace {
+std::atomic<int> g_pop_mult{1}, g_pop_repop{0};   // repop: 0 level default, 1 force on, 2 force off
+std::atomic<bool> g_pop_dump{false};
+std::atomic<int> g_pop_alive{-1}, g_pop_dead{0}, g_pop_actors{0};   // live census: AI pawns alive / bodies / all actors
+std::mutex g_pop_mu;
+std::string g_pop_status = "no level yet";
+struct PopZone {
+  uint32_t obj = 0, cls = 0; std::string name;
+  uint32_t cnt_off = 0, tim_off = 0, rep_off = 0, rep_mask = 0;
+  uint32_t cnt[2] = {}, tim[2] = {}; bool rep = false; int fmt = 0;   // fmt: 1 floats, 2 ints, 0 unknown (left alone)
+  bool scaled = false; int rep_written = -1;   // what we last wrote; nothing is written while the dial is at its defaults
+};
+std::vector<PopZone> g_pop_zones;
+uint32_t g_pop_mgr = 0;
+inline void Put32(uint8_t* base, uint32_t a, uint32_t v) { base[a] = uint8_t(v >> 24); base[a + 1] = uint8_t(v >> 16); base[a + 2] = uint8_t(v >> 8); base[a + 3] = uint8_t(v); }
+inline float AsF(uint32_t w) { float f; std::memcpy(&f, &w, 4); return f; }
+inline uint32_t AsW(float f) { uint32_t w; std::memcpy(&w, &f, 4); return w; }
+}  // namespace
+void BsSetPopulation(int m) { g_pop_mult = std::clamp(m, 1, 4); }
+void BsSetRepop(int m) { g_pop_repop = std::clamp(m, 0, 2); }
+void BsPopDump() { g_pop_dump = true; }
+std::string BsPopStatus() {
+  std::lock_guard<std::mutex> lk(g_pop_mu);
+  if (g_pop_alive.load() < 0) return g_pop_status;
+  return fmt::format("{} | now: {} enemies/AI alive, {} bodies, {} actors", g_pop_status, g_pop_alive.load(), g_pop_dead.load(), g_pop_actors.load());
+}
+static std::string FNameAtAddr(PPCContext& ctx, uint8_t* base, uint32_t addr, uint32_t sp);
+static void BsPopTick(PPCContext& ctx, uint8_t* base) {
+  using clk = std::chrono::steady_clock;
+  static auto s_last = clk::now() - std::chrono::seconds(10);
+  static int s_m = -1, s_r = -1; static uint32_t s_nomgr_for = 0;
+  const int mult = g_pop_mult.load(), repop = g_pop_repop.load();
+  const bool dump = g_pop_dump.exchange(false);
+  const bool changed = mult != s_m || repop != s_r || dump;
+  static int s_every = 2;   // seconds between passes; stretched to 30 if a pass is ever slow
+  if (!changed && clk::now() - s_last < std::chrono::seconds(s_every)) return;
+  s_last = clk::now();
+  bool heavy = false;   // this pass walked every actor (level start, F9 open, "Log zones"); light passes touch only the zones
+  struct Timer { clk::time_point t0; int* every; bool* heavy; ~Timer() {
+    double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+    if (ms > 5.0) REXLOG_INFO("bioshock-recomp: pop: {} pass took {:.1f} ms", *heavy ? "full" : "light", ms);
+    if (!*heavy && ms > 50.0 && *every < 30) { *every = 30; REXLOG_INFO("bioshock-recomp: pop: slow light pass - now every 30 s"); } } } timer{clk::now(), &s_every, &heavy};
+  auto status = [](std::string s) { std::lock_guard<std::mutex> lk(g_pop_mu); g_pop_status = std::move(s); };
+  uint32_t pl = g_player.load(), data = 0, num = 0;
+  if (!InHeap(pl) || !FindActorList(base, pl, &data, &num)) return;
+  uint32_t sp = (ctx.r1.u32 - 0x5000) & ~0xFu;
+  // Classes are told apart by the properties they have (looked up by name, per class, once per level). Not by
+  // cached class names: class objects move between levels and a name cached for an address goes stale - that is why
+  // the manager was "not found" after a level change on 2026-11-10.
+  static std::unordered_map<uint32_t, int> s_kind;   // class -> 3 LevelInfo, 4 pawn, 0 other
+  static uint32_t s_list = 0, s_mgr_cls = 0, s_pl = 0;
+  const bool moved = pl != s_pl || data != s_list;   // new level (or the actor array was reallocated)
+  if (moved) { s_pl = pl; s_list = data; s_kind.clear(); }
+  uint32_t mgr = 0, linfo = 0; int alive = 0, dead = 0; uint32_t po = 0, pm = 0;
+  // Walking 6000+ actors costs ~22 ms (a dropped frame). Do it only when something needs it: a new level (the actor
+  // array moved or the manager is gone), the F9 panel is open (live census), or "Log zones".
+  const bool mgr_ok = g_pop_mgr && HostReadable(base + g_pop_mgr, 0x40) && s_mgr_cls && BE32(base, g_pop_mgr + 0x2C) == s_mgr_cls;
+  heavy = dump || BsPanelIsOpen() || moved || !mgr_ok;
+  if (!heavy) mgr = g_pop_mgr;
+  for (uint32_t i = 0; heavy && i < num; ++i) {
+    uint32_t a = BE32(base, data + 4 * i);
+    if (!InHeap(a)) continue;
+    uint32_t cls = BE32(base, a + 0x2C);
+    if (!HeapOrImg(cls)) continue;
+    auto it = s_kind.find(cls);
+    if (it == s_kind.end()) {
+      int kd = 0;
+      if (FindPropOffset(ctx, base, a, "SpawningManager", &po, &pm)) kd = 3;
+      else if (FindPropOffset(ctx, base, a, "Controller", &po, &pm) && FindPropOffset(ctx, base, a, "Health", &po, &pm)) kd = 4;
+      it = s_kind.emplace(cls, kd).first;
+    }
+    if (it->second == 3 && !linfo) linfo = a;
+    else if (it->second == 4 && a != pl) { if (AsF(BE32(base, a + 1356)) > 0.0f) ++alive; else ++dead; }   // Health float at pawn+1356
+  }
+  if (heavy) { g_pop_alive = alive; g_pop_dead = dead; g_pop_actors = int(num); }
+  // The manager is not an actor: it is LevelInfo.SpawningManager.
+  if (!mgr && linfo && FindPropOffset(ctx, base, linfo, "SpawningManager", &po, &pm)) {
+    uint32_t m = BE32(base, linfo + po), zo2 = 0;
+    if (InHeap(m) && HostReadable(base + m, 0x200) && FindPropOffset(ctx, base, m, "SpawningZones", &zo2, &pm)) mgr = m;
+  }
+  s_mgr_cls = mgr ? BE32(base, mgr + 0x2C) : 0;
+  if (!mgr) {
+    if (s_nomgr_for != linfo || dump) {
+      s_nomgr_for = linfo;
+      Log(fmt::format("pop: no spawning manager found (LevelInfo {:08X}, {} actors)", linfo, num));
+    }
+    g_pop_zones.clear(); g_pop_mgr = 0; status("no spawning manager in this level");
+    return;
+  }
+  if (mgr != g_pop_mgr || dump) {   // new level (or asked): rebuild the zone list from scratch
+    g_pop_mgr = mgr; g_pop_zones.clear(); s_m = s_r = -1;
+    DumpProps(ctx, base, mgr, "SpawningManager", 300);
+    std::vector<uint32_t> zs;
+    uint32_t zo = 0, zm = 0;
+    if (FindPropOffset(ctx, base, mgr, "SpawningZones", &zo, &zm)) {
+      uint32_t d = BE32(base, mgr + zo), n = BE32(base, mgr + zo + 4);
+      Log(fmt::format("pop: SpawningZones +{:X}: data {:08X} num {}", zo, d, n));
+      if (InHeap(d) && n && n < 256 && HostReadable(base + d, size_t(4) * n)) {
+        for (uint32_t i = 0; i < n; ++i) if (uint32_t z = BE32(base, d + 4 * i); InHeap(z) && HostReadable(base + z, 0xA0) && FindPropOffset(ctx, base, z, "DesiredAggressorCount", &po, &pm)) zs.push_back(z);
+        if (zs.empty()) {   // not object pointers: show the raw words so the layout can be read off the log
+          std::string r; for (uint32_t i = 0; i < 48 && HostReadable(base + d + 4 * i, 4); ++i) { if (i % 8 == 0) r += fmt::format("\n    {:08X}:", d + 4 * i); r += fmt::format(" {:08X}", BE32(base, d + 4 * i)); }
+          Log("pop: zone array is not object pointers; raw:" + r);
+        }
+      }
+    }
+    bool first = true;
+    for (uint32_t z : zs) {
+      PopZone p; p.obj = z; p.cls = BE32(base, z + 0x2C);
+      if (first) { first = false; DumpProps(ctx, base, z, "SpawnZoneInfo", 300); }
+      uint32_t o = 0, m = 0;
+      if (FindPropOffset(ctx, base, z, "SpawnZoneName", &o, &m)) p.name = FNameAtAddr(ctx, base, z + o, sp);
+      if (FindPropOffset(ctx, base, z, "DesiredAggressorCount", &o, &m)) { p.cnt_off = o; p.cnt[0] = BE32(base, z + o); p.cnt[1] = BE32(base, z + o + 4); }
+      if (FindPropOffset(ctx, base, z, "AggressorRepopulationTimeDelta", &o, &m)) { p.tim_off = o; p.tim[0] = BE32(base, z + o); p.tim[1] = BE32(base, z + o + 4); }
+      // The mask finder skips the top bit, and this flag IS the top bit (first bool of its word; the protector flag
+      // is the next one, 0x40000000 - seen as C0000000 with both on, 2026-11-10).
+      if (FindPropOffset(ctx, base, z, "bAggressorRepopulationEnabled", &o, &m)) { if (!m) m = 0x80000000u; p.rep_off = o; p.rep_mask = m; p.rep = (BE32(base, z + o) & m) != 0; }
+      auto isi = [](uint32_t w) { return w <= 64; };
+      auto isf = [](uint32_t w) { return w == 0 || (w >= 0x3E000000 && w <= 0x42800000); };
+      p.fmt = !p.cnt_off ? 0 : (isi(p.cnt[0]) && isi(p.cnt[1])) ? 2 : (isf(p.cnt[0]) && isf(p.cnt[1])) ? 1 : 0;
+      Log(fmt::format("pop: zone {:08X} '{}' count {:08X}/{:08X} ({}) delay {:.0f}..{:.0f} s respawn {}", z, p.name, p.cnt[0], p.cnt[1],
+                      p.fmt == 1 ? fmt::format("{:.0f}..{:.0f}", AsF(p.cnt[0]), AsF(p.cnt[1])) : p.fmt == 2 ? fmt::format("{}..{}", p.cnt[0], p.cnt[1]) : std::string("unknown format"),
+                      AsF(p.tim[0]), AsF(p.tim[1]), p.rep_mask ? (p.rep ? "on" : "off") : "?") + fmt::format(" [offsets count +{:X} delay +{:X} respawn +{:X} mask {:08X}]", p.cnt_off, p.tim_off, p.rep_off, p.rep_mask));
+      g_pop_zones.push_back(std::move(p));
+    }
+    Log(fmt::format("pop: manager {:08X}, {} zones", mgr, g_pop_zones.size()));
+  }
+  int applied = 0, rep_on = 0; float lo = 1e9f, hi = 0.0f;
+  for (PopZone& p : g_pop_zones) {
+    if (!HostReadable(base + p.obj, 0x40) || BE32(base, p.obj + 0x2C) != p.cls) continue;   // freed / reused
+    if (p.fmt && (mult > 1 || p.scaled)) {
+      p.scaled = mult > 1;
+      for (int k = 0; k < 2; ++k) {
+        float v = p.fmt == 1 ? AsF(p.cnt[k]) : float(p.cnt[k]);
+        float nv = mult > 1 ? std::min(v * mult, std::max(v, 8.0f)) : v;   // hard cap 8 per zone (never below the original)
+        Put32(base, p.obj + p.cnt_off + 4 * k, p.fmt == 1 ? AsW(nv) : uint32_t(nv + 0.5f));
+        if (k == 1) { lo = std::min(lo, nv); hi = std::max(hi, nv); }
+      }
+      ++applied;
+    }
+    if (p.tim_off && (mult > 1 || s_m > 1))
+      for (int k = 0; k < 2; ++k) {
+        float v = AsF(p.tim[k]);
+        if (v >= 1.0f && v <= 100000.0f) Put32(base, p.obj + p.tim_off + 4 * k, AsW(mult > 1 ? std::max(v / mult, std::min(v, 10.0f)) : v));
+      }
+    if (p.rep_mask) {
+      // Level scripts switch this flag themselves. If it no longer holds what we wrote, the game changed it: that
+      // becomes the value to restore. At "level default" nothing is written (after one restore).
+      uint32_t w = BE32(base, p.obj + p.rep_off);
+      bool cur = (w & p.rep_mask) != 0;
+      if (p.rep_written < 0) p.rep = cur; else if (cur != (p.rep_written == 1)) p.rep = cur;
+      if (repop || p.rep_written >= 0) {
+        bool on = repop == 1 ? true : repop == 2 ? false : p.rep;
+        Put32(base, p.obj + p.rep_off, on ? (w | p.rep_mask) : (w & ~p.rep_mask));
+        p.rep_written = repop ? (on ? 1 : 0) : -1;
+        cur = on;
+      }
+      rep_on += cur;
+    }
+  }
+  if (changed) Log(fmt::format("pop: x{} respawn {} -> {} of {} zones scaled, respawn on in {}", mult, repop == 1 ? "forced on" : repop == 2 ? "forced off" : "level default", applied, g_pop_zones.size(), rep_on));
+  s_m = mult; s_r = repop;
+  status(g_pop_zones.empty() ? std::string("spawning manager found, no zones read (see log)")
+                             : fmt::format("{} zones, {} scaled (largest max {:.0f}), respawn on in {}", g_pop_zones.size(), applied, hi, rep_on));
+}
+
+static void BsBridgeTick(PPCContext& ctx, uint8_t* base);   // BS2 package bridge (end of this file)
+void BsBridgeRequest(std::string name);
 static void BsRunDevCmds(PPCContext& ctx, uint8_t* base) {
   BsAutoCloseRevive(ctx, base);
+  BsPopTick(ctx, base);
+  BsFovTick(base);
+  BsBridgeTick(ctx, base);
+  BsFreezeTick(ctx, base);
+  BsCoopEndTick(ctx, base);
   std::vector<std::string> cmds; { std::lock_guard<std::mutex> lk(g_devcmd_mu); cmds.swap(g_devcmds); }
   for (const std::string& c : cmds) {
     char op[16] = {}; uint32_t x = 0, y = 0; int n = std::sscanf(c.c_str(), "%15s %x %x", op, &x, &y);
@@ -1549,6 +1852,8 @@ static void BsRunDevCmds(PPCContext& ctx, uint8_t* base) {
     } else if (o == "bdoff") { for (auto& m : g_bdmask) m.addr = 0; }
     else if (o == "ev" && n >= 2 && InHeap(x)) { for (auto& w : g_evwatch) if (!w.load()) { w = x; break; } }
     else if (o == "evoff") { for (auto& w : g_evwatch) w = 0; }
+    else if (o == "zones") BsPopDump();
+    else if (o == "bs2load" && c.size() > 8) BsBridgeRequest(c.substr(8));
     else if (o == "dumpobj" && n >= 2 && InHeap(x)) {
       uint32_t sp = (ctx.r1.u32 - 0x5000) & ~0xFu; std::string ch;
       for (uint32_t k = BE32(base, x + 0x2C), q = 0; k && HeapOrImg(k) && q < 10; k = BE32(base, k + 0x38), ++q) { PPCContext sv = ctx; ch += ClassNameCached(ctx, base, k, sp) + ">"; ctx = sv; }
@@ -3459,4 +3764,153 @@ extern "C" REX_FUNC(sub_82505AA0) {
     static uint32_t s_n = 0;
     if ((++s_n % 2000) == 1) REXLOG_INFO("bioshock-recomp: give: P2: IsPlayer() -> true for your Big Daddy ({} calls)", s_n);
   }
+}
+
+// ==== BioShock 2 package bridge, gate 0: visibility (2026-11-11) ====================================================
+// Question: what does BioShock 1's package loader do with a BioShock 2 package? Local copies of two BS2 packages sit
+// in the game folder as BS2Mod.u (7 KB, script only) and BS2Game.u (BS2's ShockGame.U). Never committed (game_*/).
+// BS1 = package version 141, licensee 56; BS2 = 143 / 59. The loader functions below are the BS1 twins of the ones
+// the BS2-side bridge hooks (bioshock-bridge bs2/bridge_loader.cpp), found through the Rosetta map:
+//   ULinkerLoad ctor 0x8249C150 (this, parent, filename, flags)   Localize 0x82448D98 (out, key, section) - error keys
+//   appFindPackageFile 0x82449178 (in, ?, out)                    GetPackageLinker 0x824660A8 (outer, filename, flags)
+//   VerifyImport 0x8249B210 (this, i)                             CreateExport 0x82497C60 (this, i)
+// This build only watches and forces the file lookup for names starting "BS2". Trigger: F9 > Dev > "Load BS2 object",
+// or "bs2load BS2Mod.Anything" in run\cmd.txt. Expect a refusal or a crash on the first runs: the log is the result.
+extern "C" void __imp__sub_8249C150(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_82448D98(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_82449178(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_824660A8(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_8249B210(PPCContext& __restrict ctx, uint8_t* base);
+extern "C" void __imp__sub_82497C60(PPCContext& __restrict ctx, uint8_t* base);
+namespace {
+std::mutex g_br_mu;
+std::atomic<int> g_br_depth{0}, g_br_linkers{0};
+std::atomic<uint32_t> g_br_linker{0};   // the linker of a BS2 package (set in the ctor hook)
+std::string g_br_template;               // folder of the last package the game found itself
+std::set<std::string> g_br_seen;
+bool BrReadable(uint8_t* base, uint32_t a, uint32_t len) { return a >= 0x10000 && a < 0xFFFF0000u && HostReadable(base + a, len); }
+// UTF-16BE guest string -> ASCII ("?" if it is not one).
+std::string BrWide(uint8_t* base, uint32_t a, int max = 160) {
+  if (!BrReadable(base, a, 2)) return "?";
+  std::string s;
+  for (int i = 0; i < max; ++i) {
+    if ((i & 31) == 0 && !BrReadable(base, a + 2 * i, 64)) break;
+    uint8_t hi = base[a + 2 * i], lo = base[a + 2 * i + 1];
+    if (!hi && !lo) return s;
+    if (hi || lo < 0x20 || lo > 0x7E) return "?";
+    s += char(lo);
+  }
+  return s;
+}
+void BrPutWide(uint8_t* base, uint32_t a, const std::string& s) {
+  for (size_t i = 0; i < s.size(); ++i) { base[a + 2 * i] = 0; base[a + 2 * i + 1] = uint8_t(s[i]); }
+  base[a + 2 * s.size()] = base[a + 2 * s.size() + 1] = 0;
+}
+std::string BrObjName(PPCContext& ctx, uint8_t* base, uint32_t obj) {
+  if (!obj) return "null";
+  if (!BrReadable(base, obj, 0x30)) return "?";
+  return FNameStr(ctx, base, obj, (ctx.r1.u32 - 0x6000) & ~0xFu);
+}
+}  // namespace
+
+extern "C" REX_FUNC(sub_8249C150) {
+  uint32_t self = ctx.r3.u32, parent = ctx.r4.u32, fname = ctx.r5.u32, flags = ctx.r6.u32;
+  int n = ++g_br_linkers;
+  const bool look = n <= 40 || g_br_depth.load() > 0;   // names only when it matters: each read costs memory probes
+  std::string fn = look ? BrWide(base, fname) : std::string();
+  if (look && (fn == "?" || fn.empty()) && BrReadable(base, fname, 8)) fn = BrWide(base, BE32(base, fname));   // FString*
+  std::string pn = look ? BrObjName(ctx, base, parent) : std::string();
+  const bool ours = pn.rfind("BS2", 0) == 0 || fn.find("BS2") != std::string::npos;
+  if (ours) g_br_linker = self;
+  if (ours || n <= 40) REXLOG_INFO("bioshock-recomp: bridge: linker #{} file '{}' package '{}' parent {:08X} flags {:#x}", n, fn, pn, parent, flags);
+  __imp__sub_8249C150(ctx, base);
+  if ((ours || n <= 3) && BrReadable(base, self, 0x110)) {
+    std::string dump; int tag_at = -1;
+    for (uint32_t o = 48; o < 0x108; o += 4) {
+      uint32_t v = BE32(base, self + o);
+      if (v == 0x9E2A83C1u && tag_at < 0) tag_at = int(o);
+      if (o % 32 == 16) dump += fmt::format("\n    +{:X}:", o);
+      dump += fmt::format(" {:08X}", v);
+    }
+    uint32_t ver = tag_at >= 0 ? BE32(base, self + tag_at + 4) : 0;
+    REXLOG_INFO("bioshock-recomp: bridge: linker #{} '{}' OPENED: tag at +{} version {}/{} | words from +30:{}", n, fn, tag_at, ver & 0xFFFF, ver >> 16, dump);
+  }
+}
+
+extern "C" REX_FUNC(sub_82448D98) {
+  if (g_br_depth.load() > 0) {   // only during our load: this function runs for every piece of game text
+    std::string key = BrWide(base, ctx.r4.u32, 80), sec = BrWide(base, ctx.r5.u32, 40);
+    REXLOG_INFO("bioshock-recomp: bridge: localize {}.{}   <- during the BS2 load: likely the loader's complaint", sec, key);
+  }
+  __imp__sub_82448D98(ctx, base);
+}
+
+// The 360 build only finds packages it shipped with. For a name starting "BS2", hand back a path built from the
+// folder of the last package the game found itself; the file reading after that is the game's own.
+extern "C" REX_FUNC(sub_82449178) {
+  uint32_t in = ctx.r3.u32, out = ctx.r5.u32;
+  std::string name = BrWide(base, in, 120);
+  __imp__sub_82449178(ctx, base);
+  bool ok = ctx.r3.u32 != 0;
+  std::string path = ok ? BrWide(base, out, 200) : "";
+  bool out_is_fstring = false;
+  if (ok && (path == "?" || path.empty()) && BrReadable(base, out, 12)) { path = BrWide(base, BE32(base, out), 200); out_is_fstring = path != "?"; }
+  std::lock_guard<std::mutex> lk(g_br_mu);
+  static bool s_fstring_out = false; if (out_is_fstring) s_fstring_out = true;
+  if (ok && !path.empty() && path != "?") { auto cut = path.find_last_of("\\/"); if (cut != std::string::npos) g_br_template = path.substr(0, cut + 1); }
+  const bool ours = name.rfind("BS2", 0) == 0;
+  if (ours || (g_br_seen.size() < 150 && g_br_seen.insert("F:" + name + (ok ? "+" : "-")).second))
+    REXLOG_INFO("bioshock-recomp: bridge: findpkg '{}' -> {} {}{}", name, ok ? "found" : "NOT FOUND", path, out_is_fstring ? " (out is an FString)" : "");
+  if (!ok && ours) {
+    if (g_br_template.empty()) REXLOG_INFO("bioshock-recomp: bridge: findpkg '{}': no folder template yet (no package found so far)", name);
+    else if (s_fstring_out) REXLOG_INFO("bioshock-recomp: bridge: findpkg '{}': out is an FString - not forcing in this build (template {})", name, g_br_template);
+    else { std::string forced = g_br_template + name + ".u"; BrPutWide(base, out, forced); ctx.r3.u64 = 1; REXLOG_INFO("bioshock-recomp: bridge: findpkg forcing '{}' -> {}", name, forced); }
+  }
+}
+
+extern "C" REX_FUNC(sub_824660A8) {
+  uint32_t outer = ctx.r3.u32, fname = ctx.r4.u32, flags = ctx.r5.u32;
+  static std::atomic<int> s_n{0}; int i = ++s_n;
+  const bool log = g_br_depth.load() > 0 || i <= 30;
+  std::string fn = log ? BrWide(base, fname, 160) : std::string(), on = log ? BrObjName(ctx, base, outer) : std::string();
+  if (log) REXLOG_INFO("bioshock-recomp: bridge: getlinker #{} outer {:08X} '{}' file '{}' flags {:#x}", i, outer, on, fn, flags);
+  __imp__sub_824660A8(ctx, base);
+  if (log) REXLOG_INFO("bioshock-recomp: bridge: getlinker #{} -> {:08X}", i, ctx.r3.u32);
+}
+
+// Only counted and (for the BS2 linker) logged: the last line before a crash names the step that killed the load.
+extern "C" REX_FUNC(sub_8249B210) {
+  if (ctx.r3.u32 == g_br_linker.load() && g_br_linker.load()) { static std::atomic<int> s_n{0}; if (++s_n <= 400) REXLOG_INFO("bioshock-recomp: bridge: VerifyImport {} (linker {:08X})", ctx.r4.u32, ctx.r3.u32); }
+  __imp__sub_8249B210(ctx, base);
+}
+extern "C" REX_FUNC(sub_82497C60) {
+  const bool ours = ctx.r3.u32 == g_br_linker.load() && g_br_linker.load();
+  uint32_t idx = ctx.r4.u32; static std::atomic<int> s_n{0};
+  const bool log = ours && ++s_n <= 400;
+  if (log) REXLOG_INFO("bioshock-recomp: bridge: CreateExport {} ...", idx);
+  __imp__sub_82497C60(ctx, base);
+  if (log) REXLOG_INFO("bioshock-recomp: bridge: CreateExport {} -> {:08X}", idx, ctx.r3.u32);
+}
+
+// StaticLoadObject(UClass, NULL, "Package.Object", NULL, flags, NULL) on the game thread; result logged, nothing given.
+static void BsBridgeLoad(PPCContext& ctx, uint8_t* base, const std::string& name) {
+  uint32_t uc = FindUClass(base);
+  if (!uc || name.empty() || name.size() > 200) { Log("bridge: not ready (no UClass yet - load a level first) or bad name"); return; }
+  Log("bridge: loading '" + name + "' ... (if the game dies here, the log lines above the crash are the answer)");
+  PPCContext saved = ctx;
+  uint32_t sp = (ctx.r1.u32 - 0x4000) & ~0xFu, str = sp + 0x2000;
+  BrPutWide(base, str, name);
+  ++g_br_depth;
+  ctx.r1.u64 = sp; ctx.r3.u64 = uc; ctx.r4.u64 = 0; ctx.r5.u64 = str; ctx.r6.u64 = 0; ctx.r7.u64 = 0x2002; ctx.r8.u64 = 0;
+  __imp__sub_82466660(ctx, base);
+  uint32_t obj = ctx.r3.u32;
+  --g_br_depth;
+  ctx = saved;
+  Log(fmt::format("bridge: '{}' -> {:08X}{} | BS2 linker {:08X}", name, obj, obj ? " LOADED" : " (null: not found or refused; see the bridge: lines in the log)", g_br_linker.load()));
+}
+static std::mutex g_brq_mu; static std::vector<std::string> g_brq;
+void BsBridgeRequest(std::string name) { std::lock_guard<std::mutex> lk(g_brq_mu); g_brq.push_back(std::move(name)); }
+static void BsBridgeTick(PPCContext& ctx, uint8_t* base) {
+  std::vector<std::string> q; { std::lock_guard<std::mutex> lk(g_brq_mu); q.swap(g_brq); }
+  for (const std::string& n : q) BsBridgeLoad(ctx, base, n);
 }

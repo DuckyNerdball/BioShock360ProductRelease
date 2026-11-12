@@ -4,6 +4,8 @@ Static recompilation of **BioShock (Xbox 360)** to a native Windows x64 game, bu
 [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk). Plays from the start into Rapture at 60 fps with
 sharper-than-console visuals, plus an in-game testing/cheat panel.
 
+<a href="https://recomplauncher.com"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 **No game files, and nothing generated from them, are in this repository or will ever be distributed.**
 You build the game yourself from your own legally dumped disc. Every user compiles their own copy.
 
@@ -26,8 +28,8 @@ Full guide: [docs/LAUNCHER.md](docs/LAUNCHER.md).
 | F9 | Testing panel: god mode, noclip, teleport, level travel, give all weapons / ammo / plasmids, spawn enemies, freeze world, weapon mods |
 | F10 | Mark a glitch in the log |
 | F4 / F3 | Emulator settings / debug overlay |
-| Controller 2: A / Start | Co-op: spawn a Big Daddy in a second window; that controller drives him. Friend on another PC: stream the window with Parsec / Moonlight, see [docs/COOP.md](docs/COOP.md) |
-| D-pad down x5 | Co-op: spawn a Big Daddy, keyboard + mouse drive him (WASD, E use, LMB punch, RMB drill, Space jump, C charge, R shove, T roar) |
+| F9 > Co-op > Spawn P2 | Co-op: spawn a Big Daddy in a second window. Friend on another PC: stream the window with Parsec / Moonlight, see [docs/COOP.md](docs/COOP.md). "End co-op" on the same tab removes him |
+| Controller 2: A / Start, D-pad down x5, triple F8 | Co-op shortcuts that spawn the Big Daddy. Off by default; switch them on in F9 > Co-op |
 | F11 | Co-op: Big Daddy window fullscreen |
 | Back / F6 | Co-op: move the controller between Jack and the Big Daddy |
 | F7 | Co-op: views on the wrong windows? swap them (remembered next launch) |
@@ -40,6 +42,14 @@ Use a spare save for the F9 panel: level travel and loot changes can skip story 
 
 **Only one disc build is supported:** `default.xex` SHA-1 `1be6a0fadea96b3825e6213a4a4ae1a0e4c96c91`.
 The installer stops if yours differs (other regions/versions need their own address work).
+
+## RecompLauncher
+
+`recomplauncher.json` describes the built game to [RecompLauncher](https://recomplauncher.com): which copy it needs,
+how it starts, and five settings (resolution, 16:9 or 21:9, frame rate, sharpening, anti-aliasing).
+This project publishes no built game, so RecompLauncher cannot download one. After you have built your own copy
+with `Install.ps1`, run `tools\package_local.ps1` and add the folder it makes with RecompLauncher's
+Settings > Developers > Developer tools > "Add a build". That folder contains code generated from your disc: keep it on your PC.
 
 ## Status
 

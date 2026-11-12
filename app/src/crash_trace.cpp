@@ -71,6 +71,75 @@ LONG CALLBACK CrashVeh(EXCEPTION_POINTERS* ep) {
 }
 }  // namespace
 
+// ---- hang watchdog + kill switch (ported from BS2, 11-08) ---------------------------------------------------
+// BsHeartbeat() from the game-thread tick (BsRunGives). A watcher thread: if the game thread is silent for 15 s
+// (long enough that normal level loads do not trip it), samples its host stack 3x 700 ms apart into logs/hang_<time>.txt
+// (symbolized like crashes: sub_82xxxxxx frames = guest call chain). At most 2 dumps per hang-free stretch.
+// "kill=1" in run\knobs.txt TerminateProcess()es the game from the watcher - works while the game thread is
+// frozen, so an unattended test loop never needs someone at the PC. Remove the line before the next launch.
+namespace {
+std::atomic<HANDLE> g_hb_thread{nullptr};
+std::atomic<long long> g_hb_ms{0};
+std::atomic<bool> g_hb_armed{false};   // armed once the player is captured (in a level): the front end's attract-mode
+                                       // movie blocks the game thread ~15 s by design (false HANG 11-08 14:51)
+long long NowMs() { return (long long)GetTickCount64(); }
+std::string WalkThread(HANDLE th) {
+  HANDLE proc = GetCurrentProcess();
+  CONTEXT c{}; c.ContextFlags = CONTEXT_FULL;
+  if (SuspendThread(th) == (DWORD)-1) return " (suspend failed)";
+  std::string out;
+  if (GetThreadContext(th, &c)) {
+    STACKFRAME64 sf{};
+    sf.AddrPC.Offset = c.Rip; sf.AddrPC.Mode = AddrModeFlat; sf.AddrFrame.Offset = c.Rbp; sf.AddrFrame.Mode = AddrModeFlat;
+    sf.AddrStack.Offset = c.Rsp; sf.AddrStack.Mode = AddrModeFlat;
+    out += "\n    " + Frame(proc, c.Rip) + "   <- pc";
+    for (int i = 0; i < 40; ++i) {
+      if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, th, &sf, &c, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr) || !sf.AddrPC.Offset) break;
+      if (i == 0) continue;
+      out += "\n    " + Frame(proc, sf.AddrPC.Offset);
+    }
+  } else out = " (no context)";
+  ResumeThread(th);
+  return out;
+}
+void CheckKill() {
+  if (FILE* kf = std::fopen("run\\knobs.txt", "r")) { char ln[128]; bool kill = false;
+    while (std::fgets(ln, sizeof ln, kf)) if (std::strncmp(ln, "kill=1", 6) == 0) kill = true;
+    std::fclose(kf);
+    if (kill) { REXLOG_ERROR("bioshock-recomp: kill=1 in knobs.txt - terminating"); TerminateProcess(GetCurrentProcess(), 3); } }
+}
+DWORD WINAPI HangWatch(void*) {
+  int dumps = 0;
+  for (;;) {
+    Sleep(500);
+    CheckKill();
+    HANDLE th = g_hb_thread.load(); long long hb = g_hb_ms.load();
+    if (!th || !hb || !g_hb_armed.load() || NowMs() - hb < 15000) continue;
+    if (dumps >= 2) { Sleep(5000); continue; }
+    ++dumps;
+    char path[64]; std::time_t t = std::time(nullptr);
+    std::strftime(path, sizeof(path), "logs\\hang_%Y%m%d_%H%M%S.txt", std::localtime(&t));
+    std::string all = fmt::format("HANG: game thread silent for {} ms\n", NowMs() - hb);
+    for (int k = 0; k < 3; ++k) { all += fmt::format("sample {}:{}\n", k, WalkThread(th)); Sleep(700); }
+    REXLOG_ERROR("bioshock-recomp: {}", all);
+    if (FILE* f = std::fopen(path, "a")) { std::fprintf(f, "%s\n", all.c_str()); std::fclose(f); }
+    while (g_hb_ms.load() == hb) { Sleep(1000); CheckKill(); }   // wait until it ticks again before re-arming
+    dumps = 0;
+  }
+}
+}  // namespace
+void BsHangArm(bool on) { g_hb_armed = on; }
+void BsHeartbeat() {
+  if (!g_hb_thread.load()) {
+    HANDLE h = nullptr;
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h, THREAD_ALL_ACCESS, FALSE, 0);
+    g_hb_thread = h;
+    CreateThread(nullptr, 0, HangWatch, nullptr, 0, nullptr);
+    REXLOG_INFO("bioshock-recomp: hang watchdog on (15 s, logs\\hang_*.txt); kill=1 in run\\knobs.txt closes the game");
+  }
+  g_hb_ms = NowMs();
+}
+
 void BsInstallCrashTrace() {
   SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
   SymInitialize(GetCurrentProcess(), nullptr, TRUE);
@@ -79,4 +148,6 @@ void BsInstallCrashTrace() {
 }
 #else
 void BsInstallCrashTrace() {}
+void BsHeartbeat() {}
+void BsHangArm(bool) {}
 #endif
