@@ -9,6 +9,22 @@ sharper-than-console visuals, plus an in-game testing/cheat panel.
 **No game files, and nothing generated from them, are in this repository or will ever be distributed.**
 You build the game yourself from your own legally dumped disc. Every user compiles their own copy.
 
+## What you get that the PC versions don't have
+- **Co-op.** A second player joins as a Big Daddy in their own window, with their own controller or keyboard and
+  mouse. A friend on another PC can play by streaming that window (Parsec / Moonlight). No official version of BioShock
+  has co-op. **Early alpha:** it works, and it has rough edges.
+- **A population dial.** Turn the number of splicers in each area up or down, and choose whether areas refill after
+  you clear them.
+- **A cheat and testing menu (F9)** that pauses the world while it is open: god mode, noclip, teleport, level travel,
+  all weapons, ammo and plasmids, weapon mods, spawn enemies.
+- **Picture controls the console never had:** 2x-3x resolution, 16:9 or 21:9 ultrawide, a field-of-view slider,
+  sharpening, anti-aliasing and 60 fps.
+- **Open and yours to change.** You build it from source, so you can read it, fix it and mod it. No account, no store
+  client.
+
+What the PC versions still do better: higher-resolution textures, native mouse and keyboard menus, and far less setup.
+This is the Xbox 360 game running natively, not a replacement for the PC release.
+
 ## Get it running (players)
 
 You need: Windows 10/11 x64, ~60 GB free disk, admin rights, internet, and an `.iso` you dumped from
