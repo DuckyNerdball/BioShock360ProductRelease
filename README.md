@@ -15,12 +15,28 @@ You build the game yourself from your own legally dumped disc. Every user compil
   has co-op. **Early alpha:** it works, and it has rough edges.
 - **A population dial.** Turn the number of splicers in each area up or down, and choose whether areas refill after
   you clear them.
-- **A cheat and testing menu (F9)** that pauses the world while it is open: god mode, noclip, teleport, level travel,
-  all weapons, ammo and plasmids, weapon mods, spawn enemies.
+- **A cheat menu for the campaign (F9)** that pauses the world while it is open, in six tabs:
+  - **Player:** god mode, noclip, teleport, field of view, health and EVE kits and upgrades, travel to any level.
+  - **Items:** all weapons, all ammo, all plasmids and tonics, unlock every slot, a Gene Bank anywhere.
+  - **Weapons:** live weapon mods (full-auto everything, buckshot pistol, heat-seeking bolts, grenade barrage and
+    more) and a loot override.
+  - **Enemies:** spawn any enemy, double encounters, the population dial, freeze the world.
+  - **Co-op** and **Dev** (custom console commands, logs).
+
+  Works with a controller: LB / RB switch tabs.
 - **Picture controls the console never had:** 2x-3x resolution, 16:9 or 21:9 ultrawide, a field-of-view slider,
   sharpening, anti-aliasing and 60 fps.
 - **Open and yours to change.** You build it from source, so you can read it, fix it and mod it. No account, no store
   client.
+
+### Under the hood: this build vs the PC release
+- **Physics at 60 fps.** On the PC release the physics are locked to 30 updates a second, so ragdolls and loose objects
+  move at half the frame rate unless you install a community mod. Here the game logic itself runs at 60, so ragdolls,
+  objects and animation all move at the full frame rate. The original 30 is one click away in the launcher.
+- **The console game, not a port of it.** This is the Xbox 360 code recompiled to run natively: the console's
+  controller-first interface, weapon and plasmid wheels and aim assist, as the game shipped there.
+- **Changed from inside the engine.** Co-op, the population dial and the live weapon mods work by reaching into the
+  running game's own objects and script functions, which is why they don't need modified game files.
 
 What the PC versions still do better: higher-resolution textures, native mouse and keyboard menus, and far less setup.
 This is the Xbox 360 game running natively, not a replacement for the PC release.

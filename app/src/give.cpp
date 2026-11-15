@@ -3572,6 +3572,11 @@ extern "C" REX_FUNC(sub_8247FFB0) {
       std::string fn = FnNameCached(ctx, base, k.r4.u32);
       ctx = k;
       if (!fn.empty()) LearnFunction(fn, k.r4.u32);
+      // Highlight markers for tools\highlights.ps1 (every time, not just the first two like the event log below).
+      if (self == g_player.load()) {
+        const char* mark = fn == "OnKilledOtherPawn" ? "kill" : fn == "OnKilled" ? "death" : fn == "AddLogEntry" ? "story" : nullptr;
+        if (mark) REXLOG_INFO("bioshock-recomp: MARK {} ({})", mark, fn);
+      }
       static const char* kSkip[] = {"Tick", "Timer", "AnimEnd", "PlayerTick", "UpdateEyeHeight", "ZoneChange", "PhysicsVolumeChange"};
       bool skip = fn.empty();
       for (const char* x : kSkip) skip = skip || fn == x;
