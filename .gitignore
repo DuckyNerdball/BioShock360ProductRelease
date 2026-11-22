@@ -39,3 +39,4 @@ timeline_shots/
 captures/
 *.cap
 *.rdc
+/.tools/
