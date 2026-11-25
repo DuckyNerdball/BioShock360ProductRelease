@@ -3,21 +3,32 @@
   "format": 1,
   "name": "BioShock (Xbox 360) Recomp",
   "repo": "DuckyNerdball/BioShock360ProductRelease",
-  "game": {
-    "kind": "folder",
-    "label": "The folder extracted from your own BioShock (Xbox 360) disc 1 image, the one with default.xex. To make it: run tools\\extract_disc.ps1 from this project and pick your .iso, or use extract-xiso yourself (extract-xiso -d C:\\Games\\BioShock360 BioShock.iso). Only the build with title ID 545407D8 is supported (default.xex SHA-1 1be6a0fadea96b3825e6213a4a4ae1a0e4c96c91).",
-    "check": {
-      "file": "default.xex"
+  "inputs": [
+    {
+      "id": "game",
+      "label": "Your own BioShock (Xbox 360) disc 1 image (.iso). Setup extracts it, checks it is the supported build (title ID 545407D8, default.xex SHA-1 1be6a0fadea96b3825e6213a4a4ae1a0e4c96c91) and builds the game from it on this PC. It does not need the .iso again afterwards.",
+      "formats": [
+        {
+          "type": "file",
+          "extensions": [
+            "iso"
+          ]
+        }
+      ],
+      "check": {
+        "xdvdfs": "default.xex"
+      }
     }
-  },
+  ],
   "start": {
     "program": [
+      "app/out/build/win-amd64-relwithdebinfo/bioshock.exe",
       "bioshock.exe",
-      "app/out/build/win-amd64-relwithdebinfo/bioshock.exe"
+      "BioShock.cmd"
     ],
     "args": [
       "--game_data_root",
-      "{game}",
+      "{install}/game_base1",
       "--user_data_root",
       "{install}/userdata",
       "--log_file",
@@ -46,10 +57,47 @@
       "--direct_host_resolve=true"
     ]
   },
+  "prepare": {
+    "program": [
+      "Prepare.cmd"
+    ],
+    "label": "Builds the game from your disc: installs the build tools, extracts your .iso and compiles (1-2 hours the first time; asks for administrator approval once)",
+    "env": {
+      "BS_ISO": "{input:game}"
+    },
+    "keeps_copy": true,
+    "done": [
+      "{install}/game_base1/default.xex",
+      "{install}/app/out/build/win-amd64-relwithdebinfo/bioshock.exe"
+    ],
+    "options": [
+      {
+        "id": "vs",
+        "label": "Install Visual Studio 2022 Community (C++ and Clang) if this PC does not have it",
+        "note": "Needed to compile the game. Skipped when Visual Studio C++ is already installed.",
+        "os": [
+          "windows"
+        ],
+        "license": {
+          "name": "Visual Studio 2022 Community",
+          "url": "https://visualstudio.microsoft.com/license-terms/vs2022-ga-community/"
+        },
+        "args": [
+          "-AcceptVsLicense"
+        ],
+        "required": false
+      }
+    ]
+  },
   "saves": [
     "{install}/userdata"
   ],
   "folders": {
+    "game": [
+      {
+        "path": "{install}/game_base1"
+      }
+    ],
     "saves": [
       {
         "path": "{install}/userdata"

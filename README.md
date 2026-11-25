@@ -46,6 +46,12 @@ This is the Xbox 360 game running natively, not a replacement for the PC release
 You need: Windows 10/11 x64, ~60 GB free disk, admin rights, internet, and an `.iso` you dumped from
 your own **BioShock (Xbox 360) disc 1** (TitleID 545407D8).
 
+**Easiest: RecompLauncher.** Install BioShock Recomp there, pick your `.iso`, tick the Visual Studio licence if this PC
+doesn't have Visual Studio C++, and press Set Up. Approve the one administrator prompt; it installs the build tools,
+extracts your disc and compiles the game (1-2 hours the first time), then shows Play.
+
+**Or by hand:**
+
 1. Download this repo (green **Code** button > Download ZIP, or `git clone`) to a short path such as `C:\Games\bioshock-recomp`.
 2. Right-click **`Install.ps1`** > **Run with PowerShell**, and pick your `.iso` when asked.
    It installs the build tools (Visual Studio C++ + Clang, CMake, Ninja, Git, Python), extracts your disc,
@@ -77,22 +83,16 @@ The installer stops if yours differs (other regions/versions need their own addr
 
 ## RecompLauncher
 
-`recomplauncher.json` describes the built game to [RecompLauncher](https://recomplauncher.com): which copy it needs,
-how it starts, and five settings (resolution, 16:9 or 21:9, frame rate, sharpening, anti-aliasing).
-This project publishes no built game, so RecompLauncher cannot download one. After you have built your own copy
-with `Install.ps1`, run `tools\package_local.ps1` and add the folder it makes with RecompLauncher's
-Settings > Developers > Developer tools > "Add a build". That folder contains code generated from your disc: keep it on your PC.
+`recomplauncher.json` tells [RecompLauncher](https://recomplauncher.com) how to set the game up and start it, plus five
+settings (resolution, 16:9 or 21:9, frame rate, sharpening, anti-aliasing). The release zip holds only this project's
+code and scripts. RecompLauncher asks for your disc 1 `.iso` and runs `Prepare.cmd` once (= `Install.ps1 -Launcher`:
+no questions, one administrator prompt, progress shown in the launcher). It builds the game into the install folder,
+keeps the extracted disc there as `game_base1`, and does not need the `.iso` again. Setup exit codes: 2 no disc image,
+3 Visual Studio licence not ticked, 4 build failed (log in `logs\install_*.log`), 5 not the supported disc,
+6 administrator prompt declined.
 
-RecompLauncher asks for your copy as a **game folder**: the files extracted from your disc image, with `default.xex`
-at the top. If you ran `Install.ps1` that folder already exists as `game_base1`. To make one from your `.iso` on its own:
-
-```powershell
-.\tools\extract_disc.ps1                                             # asks for the .iso, extracts to .\game_base1
-.\tools\extract_disc.ps1 -Iso D:\BioShock.iso -Out D:\Games\BioShock360   # or choose both
-```
-
-It downloads the open-source `extract-xiso`, extracts the disc (about 2 GB) and checks it is the supported build.
-By hand, the same thing is `extract-xiso -d <folder> <your.iso>`.
+Already built it by hand? `tools\package_local.ps1` makes a folder you can add with RecompLauncher's
+Settings > Developers > Developer tools > "Add a build". It contains code generated from your disc: keep it on your PC.
 
 ## Status
 
